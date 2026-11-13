@@ -5,6 +5,7 @@ import io
 import json
 import re
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -1232,6 +1233,30 @@ class FocusedLauncherTests(unittest.TestCase):
         self.assertEqual(len(guard_reads), 1, guard_reads)
 
 
+
+
+class FrameSparseConsumerTests(unittest.TestCase):
+    def test_each_workflow_frame_consumer_imports_from_its_declared_checkout(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/test-e2e.yml").read_text())
+        for job in ("build", "test"):
+            step = next(item for item in workflow["jobs"][job]["steps"]
+                        if item.get("name") == "Checkout the E2E test steps")
+            with self.subTest(job=job), tempfile.TemporaryDirectory() as directory:
+                checkout = Path(directory)
+                for relative in step["with"]["sparse-checkout"].split():
+                    source = ROOT / relative
+                    destination = checkout / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if source.is_dir():
+                        shutil.copytree(source, destination)
+                    else:
+                        shutil.copyfile(source, destination)
+                result = subprocess.run(
+                    [sys.executable, "-I", str(checkout / "scripts/ci/e2e-frames.py"), "--help"],
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--repo", result.stdout)
 
 
 class FrameOwnerTests(unittest.TestCase):
