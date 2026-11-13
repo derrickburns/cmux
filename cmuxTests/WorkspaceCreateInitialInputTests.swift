@@ -10,6 +10,54 @@ import Testing
 #endif
 
 extension WorkspaceCreateWorkingDirectoryTests {
+    @Test func initialLocalTmuxCommandIsCapturedWithoutReplacingTheInitialSurface() throws {
+        let manager = TabManager(autoWelcomeIfNeeded: false)
+        let originalWorkspaceIDs = Set(manager.tabs.map(\.id))
+        let binding = LocalTmuxSessionBinding(
+            sessionID: try #require(LocalTmuxSessionIdentity("$31")),
+            serverID: UUID(uuidString: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")!,
+            sessionCreated: 31
+        )
+        let command = LocalTmuxCommandBuilder(
+            tmuxPath: "/synthetic/tmux",
+            socketPath: "/private/tmp/synthetic-case-view/server.sock"
+        ).attachCommand(binding: binding)
+
+        _ = TerminalController.shared.v2WorkspaceCreate(params: [
+            "initial_command": command,
+            "focus": false,
+        ], tabManager: manager)
+
+        let created = try #require(manager.tabs.first { !originalWorkspaceIDs.contains($0.id) })
+        let panels = created.panels.values.compactMap { $0 as? TerminalPanel }
+        let panel = try #require(panels.first)
+        #expect(panels.count == 1)
+        #expect(panel.surface.debugInitialCommand() == command)
+        #expect(panel.surface.debugTmuxStartCommand() == command)
+        #expect(panel.surface.debugInitialInputForTesting() == nil)
+        let snapshot = created.sessionSnapshot(includeScrollback: false)
+        let saved = try #require(snapshot.panels.first { $0.id == panel.id })
+        #expect(saved.terminal?.tmuxStartCommand == command)
+    }
+
+    @Test func initialLocalTmuxLookalikeIsNotEnrolledForSessionRestore() throws {
+        let manager = TabManager(autoWelcomeIfNeeded: false)
+        let originalWorkspaceIDs = Set(manager.tabs.map(\.id))
+        let command = "/usr/bin/env CMUX_LOCAL_TMUX=1 /synthetic/tmux attach -t foreign"
+
+        _ = TerminalController.shared.v2WorkspaceCreate(params: [
+            "initial_command": command,
+            "focus": false,
+        ], tabManager: manager)
+
+        let created = try #require(manager.tabs.first { !originalWorkspaceIDs.contains($0.id) })
+        let panel = try #require(created.panels.values.compactMap { $0 as? TerminalPanel }.first)
+        #expect(panel.surface.debugInitialCommand() == WorkspaceInitialCommandLoginShell.wrap(command))
+        #expect(panel.surface.debugTmuxStartCommand() == nil)
+        let saved = try #require(created.sessionSnapshot(includeScrollback: false).panels.first { $0.id == panel.id })
+        #expect(saved.terminal?.tmuxStartCommand == nil)
+    }
+
     @MainActor
     private final class CloudRoutingProvider: SurfaceProvider {
         let machine: SurfaceMachineID
