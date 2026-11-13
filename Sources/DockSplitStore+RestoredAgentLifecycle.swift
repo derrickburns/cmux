@@ -27,6 +27,16 @@ extension DockSplitStore {
         guard let terminal = panels[panelId] as? TerminalPanel else { return }
         flushPendingTerminalTitleUpdate(panelId: panelId)
         let previousState = terminal.shellActivity.state
+        if var restoredBinding = surfaceResumeBindingsByPanelId[panelId] {
+            let previousObservation = restoredBinding.restoredProcessDetectionObservation
+            restoredBinding.observeRestoredProcessDetectionShellState(
+                state,
+                terminalLifecycleID: terminal.surface.terminalLifecycleId
+            )
+            if previousObservation != restoredBinding.restoredProcessDetectionObservation {
+                surfaceResumeBindingsByPanelId[panelId] = restoredBinding
+            }
+        }
         terminal.updateShellActivityState(state)
         // A transferred terminal can already report promptIdle before the
         // destination receives its first prompt marker. Replaying that

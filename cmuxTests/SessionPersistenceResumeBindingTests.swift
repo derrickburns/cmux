@@ -756,3 +756,305 @@ import Testing
         return directory.appendingPathComponent(executableName, isDirectory: false).path
     }
 }
+
+
+// Startup ownership follows the binding's exact generation, not scan timing.
+@MainActor
+@Suite(.serialized)
+struct ProcessDetectedStartupOwnershipTests {
+    @Test(arguments: ["tmux", "ssh"])
+    func workspaceKeepsQueuedRestoreUntilMatchingChild(kind: String) throws {
+        let workspace = Workspace()
+        defer { workspace.teardownAllPanels() }
+        var snapshot = workspace.sessionSnapshot(includeScrollback: false)
+        let original = binding(kind: kind)
+        snapshot.panels[0].terminal?.resumeBinding = original
+        workspace.restoreSessionSnapshot(snapshot)
+        let panelID = try #require(workspace.focusedPanelId)
+        #expect(!workspace.restoredAgentLifecycle.ownsInFlightRestoredCommand(panelId: panelID))
+        #expect(workspace.restoredAgentLifecycle.startupInput(panelId: panelID) == nil)
+        for _ in 0..<8 {
+            let saved = workspace.sessionSnapshot(
+                includeScrollback: false,
+                surfaceResumeBindingIndex: .empty
+            )
+            #expect(saved.panels.first?.terminal?.resumeBinding == original)
+        }
+        let detected = SurfaceResumeBindingIndex(bindingsByPanel: [
+            .init(workspaceId: workspace.id, panelId: panelID): original
+        ])
+        _ = workspace.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: detected)
+        #expect(workspace.surfaceResumeBinding(panelId: panelID)?.restoredProcessDetectionObservation == nil)
+        _ = workspace.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
+        let exited = workspace.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
+        #expect(exited.panels.first?.terminal?.resumeBinding == nil)
+    }
+
+    @Test(arguments: [DockScope.workspace, .global])
+    func dockKeepsTheSameQueuedRestoreAndRetiresSuccessfulDetach(scope: DockScope) throws {
+        let source = Workspace()
+        defer { source.teardownAllPanels() }
+        var panel = try #require(source.sessionSnapshot(includeScrollback: false).panels.first)
+        let original = binding()
+        panel.terminal?.resumeBinding = original
+        let dock = DockSplitStore(workspaceId: UUID(), scope: scope, baseDirectoryProvider: { "/tmp" })
+        defer { dock.closeAllPanels() }
+        let mapping = dock.restoreSessionSnapshot(SessionSplitContainerSnapshot(
+            focusedPanelId: panel.id,
+            layout: .pane(SessionPaneLayoutSnapshot(panelIds: [panel.id], selectedPanelId: panel.id)),
+            panels: [panel]
+        ))
+        let panelID = try #require(mapping[panel.id])
+        #expect(!dock.restoredAgentLifecycle.ownsInFlightRestoredCommand(panelId: panelID))
+        #expect(dock.restoredAgentLifecycle.startupInput(panelId: panelID) == nil)
+        for pass in 0..<8 {
+            let saved = dock.sessionSnapshot(
+                includeScrollback: false,
+                surfaceResumeBindingIndex: pass.isMultiple(of: 2) ? .empty : nil
+            )
+            #expect(saved.panels.first?.terminal?.resumeBinding == original)
+        }
+        let detected = SurfaceResumeBindingIndex(bindingsByPanel: [
+            .init(workspaceId: dock.workspaceId, panelId: panelID): original
+        ])
+        _ = dock.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: detected)
+        let exited = dock.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
+        #expect(exited.panels.first?.terminal?.resumeBinding == nil)
+    }
+
+    @Test func initialPromptCannotCompleteAnUnissuedRestore() {
+        let generation = UUID()
+        var pending = binding()
+        pending.armRestoredProcessDetectionObservation(terminalLifecycleID: generation)
+        pending.observeRestoredProcessDetectionShellState(.promptIdle, terminalLifecycleID: generation)
+        #expect(pending.restoredProcessDetectionObservation?.phase == .queued)
+        for _ in 0..<10_000 {
+            let keepPending = pending.reconcileRestoredProcessDetection(detected: nil, detectionAvailable: true)
+            #expect(keepPending)
+        }
+        #expect(pending.autoResume == true)
+    }
+
+    @Test func aDifferentSocketSessionOrDirectoryCannotSettleThePendingRestore() {
+        let original = binding()
+        var pending = original
+        pending.armRestoredProcessDetectionObservation(terminalLifecycleID: UUID())
+        var wrongSocket = original
+        wrongSocket.launchCommand?.arguments[2] = "other-socket"
+        var wrongSession = original
+        wrongSession.checkpointId = "other-session"
+        var wrongDirectory = original
+        wrongDirectory.cwd = "/other-directory"
+        for other in [wrongSocket, wrongSession, wrongDirectory] {
+            let keepPending = pending.reconcileRestoredProcessDetection(detected: other, detectionAvailable: true)
+            #expect(keepPending)
+            #expect(pending.restoredProcessDetectionObservation != nil)
+        }
+        var observed = original
+        observed.updatedAt += 1
+        observed.launchCommand?.capturedAt = 101
+        let keepPendingAfterMatchingDetection = pending.reconcileRestoredProcessDetection(detected: observed, detectionAvailable: true)
+        #expect(!keepPendingAfterMatchingDetection)
+        #expect(pending.restoredProcessDetectionObservation == nil)
+    }
+
+    @Test func completedCommandKeepsAnExactManualRecovery() throws {
+        let generation = UUID()
+        let original = binding()
+        var pending = original
+        pending.armRestoredProcessDetectionObservation(terminalLifecycleID: generation)
+        pending.observeRestoredProcessDetectionShellState(.commandRunning, terminalLifecycleID: generation)
+        pending.observeRestoredProcessDetectionShellState(.promptIdle, terminalLifecycleID: generation)
+        let keepManualRecovery = pending.reconcileRestoredProcessDetection(detected: nil, detectionAvailable: true)
+        #expect(keepManualRecovery)
+        #expect(pending.command == original.command)
+        #expect(pending.launchCommand == original.launchCommand)
+        #expect(pending.autoResume == false)
+        #expect(pending.approvalPolicy == .manual)
+        #expect(pending.approvalRecordId == nil)
+        let decoded = try JSONDecoder().decode(
+            SurfaceResumeBindingSnapshot.self,
+            from: JSONEncoder().encode(pending)
+        )
+        var reloaded = decoded
+        #expect(reloaded.restoredProcessDetectionObservation == nil)
+        let keepReloadedManualRecovery = reloaded.reconcileRestoredProcessDetection(detected: nil, detectionAvailable: true)
+        #expect(keepReloadedManualRecovery)
+        #expect(reloaded.autoResume == false)
+    }
+
+    @Test func ephemeralOwnershipDoesNotChangePersistedEqualityOrJSON() throws {
+        let original = binding()
+        var pending = original
+        pending.armRestoredProcessDetectionObservation(terminalLifecycleID: UUID())
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        #expect(pending == original)
+        #expect(try encoder.encode(pending) == encoder.encode(original))
+    }
+
+    @Test func failureAndClearOnlyRetireTheMountedOriginalGeneration() throws {
+        let workspace = Workspace()
+        defer { workspace.teardownAllPanels() }
+        var snapshot = workspace.sessionSnapshot(includeScrollback: false)
+        let original = binding()
+        snapshot.panels[0].terminal?.resumeBinding = original
+        workspace.restoreSessionSnapshot(snapshot)
+        let panelID = try #require(workspace.focusedPanelId)
+        let terminal = try #require(workspace.panels[panelID] as? TerminalPanel)
+        #expect(terminal.surface.onStartupRestoreAbandoned?(UUID()) == false)
+        #expect(terminal.surface.onStartupRestoreAbandoned?(terminal.surface.terminalLifecycleId) == true)
+        let manual = try #require(workspace.surfaceResumeBinding(panelId: panelID))
+        #expect(manual.command == original.command)
+        #expect(manual.launchCommand == original.launchCommand)
+        #expect(manual.autoResume == false)
+        #expect(manual.approvalPolicy == .manual)
+        #expect(workspace.clearSurfaceResumeBinding(panelId: panelID))
+        #expect(terminal.surface.onStartupRestoreAbandoned?(terminal.surface.terminalLifecycleId) == false)
+    }
+
+    @Test func explicitInputRetiresAutomaticOwnershipWithoutChangingTheSavedInvocation() throws {
+        let workspace = Workspace()
+        defer { workspace.teardownAllPanels() }
+        var snapshot = workspace.sessionSnapshot(includeScrollback: false)
+        let original = binding()
+        snapshot.panels[0].terminal?.resumeBinding = original
+        workspace.restoreSessionSnapshot(snapshot)
+        let panelID = try #require(workspace.focusedPanelId)
+        let terminal = try #require(workspace.panels[panelID] as? TerminalPanel)
+        terminal.surface.onExplicitInput?()
+        let manual = try #require(workspace.surfaceResumeBinding(panelId: panelID))
+        #expect(manual.command == original.command)
+        #expect(manual.launchCommand == original.launchCommand)
+        #expect(manual.autoResume == false)
+        #expect(manual.approvalPolicy == .manual)
+    }
+
+    @Test func publicCancellationRetiresAnOrdinaryWorkspaceRestore() throws {
+        let workspace = Workspace()
+        defer { workspace.teardownAllPanels() }
+        let terminal = try stagedTerminal(in: workspace)
+        let original = try #require(workspace.surfaceResumeBinding(panelId: terminal.id))
+        terminal.surface.cancelStartupRestoreAdmission()
+        let manual = try #require(workspace.surfaceResumeBinding(panelId: terminal.id))
+        #expect(manual.command == original.command)
+        #expect(manual.launchCommand == original.launchCommand)
+        #expect(manual.autoResume == false)
+        #expect(manual.approvalPolicy == .manual)
+        workspace.updatePanelShellActivityState(panelId: terminal.id, state: .promptIdle)
+        for _ in 0..<8 {
+            _ = workspace.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
+        }
+        #expect(workspace.surfaceResumeBinding(panelId: terminal.id)?.autoResume == false)
+    }
+
+    @Test(arguments: [DockScope.workspace, .global])
+    func publicCancellationFollowsTheTransferredGenerationIntoEitherDock(scope: DockScope) throws {
+        let source = Workspace()
+        defer { source.teardownAllPanels() }
+        let terminal = try stagedTerminal(in: source)
+        let original = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+        let previousOwner = terminal.surface.onStartupRestoreAbandoned
+        let transfer = try #require(source.detachSurface(panelId: terminal.id))
+        let dock = DockSplitStore(workspaceId: UUID(), scope: scope, baseDirectoryProvider: { "/tmp" })
+        defer { dock.closeAllPanels() }
+        let pane = try #require(dock.bonsplitController.allPaneIds.first)
+        let panelID = try #require(dock.attachDetachedSurface(transfer, inPane: pane, focus: false))
+        #expect(previousOwner?(terminal.surface.terminalLifecycleId) == false)
+        #expect(dock.surfaceResumeBindingsByPanelId[panelID]?.autoResume == true)
+        terminal.surface.cancelStartupRestoreAdmission()
+        let manual = try #require(dock.surfaceResumeBindingsByPanelId[panelID])
+        #expect(manual.command == original.command)
+        #expect(manual.launchCommand == original.launchCommand)
+        #expect(manual.autoResume == false)
+        #expect(manual.approvalPolicy == .manual)
+        dock.updatePanelShellActivityState(panelId: panelID, state: .promptIdle)
+        for _ in 0..<8 {
+            _ = dock.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
+        }
+        #expect(dock.surfaceResumeBindingsByPanelId[panelID]?.autoResume == false)
+    }
+
+    @Test func workspaceRejectsAnOldEventAfterTheSameSurfaceAdvancesGeneration() throws {
+        let workspace = Workspace()
+        defer { workspace.teardownAllPanels() }
+        let terminal = try stagedTerminal(in: workspace)
+        let surface = terminal.surface
+        let previousGeneration = surface.terminalLifecycleId
+        let original = try #require(workspace.surfaceResumeBinding(panelId: terminal.id))
+        #expect(surface.suspendRuntimeSurfaceForAgentHibernation(reason: "restore-generation-regression"))
+        #expect(terminal.surface === surface)
+        #expect(surface.terminalLifecycleId != previousGeneration)
+        #expect(surface.onStartupRestoreAbandoned?(previousGeneration) == false)
+        #expect(workspace.surfaceResumeBinding(panelId: terminal.id)?.autoResume == true)
+        var replacement = original
+        replacement.updatedAt += 1
+        replacement.armRestoredProcessDetectionObservation(terminalLifecycleID: surface.terminalLifecycleId)
+        workspace.surfaceResumeBindingsByPanelId[terminal.id] = replacement
+        #expect(surface.onStartupRestoreAbandoned?(surface.terminalLifecycleId) == true)
+        #expect(workspace.surfaceResumeBinding(panelId: terminal.id)?.autoResume == false)
+    }
+
+    @Test(arguments: [DockScope.workspace, .global])
+    func eitherDockRejectsAnOldEventOnItsReusedCurrentSurface(scope: DockScope) throws {
+        let source = Workspace()
+        defer { source.teardownAllPanels() }
+        let terminal = try stagedTerminal(in: source)
+        let original = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+        let transfer = try #require(source.detachSurface(panelId: terminal.id))
+        let dock = DockSplitStore(workspaceId: UUID(), scope: scope, baseDirectoryProvider: { "/tmp" })
+        defer { dock.closeAllPanels() }
+        let pane = try #require(dock.bonsplitController.allPaneIds.first)
+        let panelID = try #require(dock.attachDetachedSurface(transfer, inPane: pane, focus: false))
+        let surface = terminal.surface
+        let previousGeneration = surface.terminalLifecycleId
+        #expect(surface.suspendRuntimeSurfaceForAgentHibernation(reason: "restore-generation-regression"))
+        #expect(terminal.surface === surface)
+        #expect(surface.terminalLifecycleId != previousGeneration)
+        #expect(surface.onStartupRestoreAbandoned?(previousGeneration) == false)
+        #expect(dock.surfaceResumeBindingsByPanelId[panelID]?.autoResume == true)
+        var replacement = original
+        replacement.updatedAt += 1
+        replacement.armRestoredProcessDetectionObservation(terminalLifecycleID: surface.terminalLifecycleId)
+        dock.surfaceResumeBindingsByPanelId[panelID] = replacement
+        #expect(surface.onStartupRestoreAbandoned?(surface.terminalLifecycleId) == true)
+        #expect(dock.surfaceResumeBindingsByPanelId[panelID]?.autoResume == false)
+    }
+
+    private func stagedTerminal(in workspace: Workspace) throws -> TerminalPanel {
+        let pane = try #require(workspace.bonsplitController.allPaneIds.first)
+        let terminal = try #require(workspace.newTerminalSurface(
+            inPane: pane,
+            focus: false,
+            initialInput: "cmux restore --surface\n",
+            runtimeSpawnPolicy: .pacedSessionRestore.requiringStartupRestoreAdmission()
+        ))
+        var pending = binding()
+        pending.armRestoredProcessDetectionObservation(terminalLifecycleID: terminal.surface.terminalLifecycleId)
+        workspace.surfaceResumeBindingsByPanelId[terminal.id] = pending
+        return terminal
+    }
+
+    private func binding(kind: String = "tmux") -> SurfaceResumeBindingSnapshot {
+        let argv = kind == "tmux"
+            ? ["tmux", "-L", "cmux-owned-restore-regression", "attach", "-t", "cmux-owned-restore-regression"]
+            : ["ssh", "cmux-owned-restore-regression.invalid"]
+        return SurfaceResumeBindingSnapshot(
+            kind: kind,
+            command: argv.map(SurfaceResumeBindingSnapshot.shellSingleQuoted).joined(separator: " "),
+            cwd: "/tmp",
+            checkpointId: "cmux-owned-restore-regression",
+            source: "process-detected",
+            launchCommand: AgentLaunchCommandSnapshot(
+                launcher: nil,
+                executablePath: argv[0],
+                arguments: argv,
+                workingDirectory: "/tmp",
+                capturedAt: 100,
+                source: "process-detected"
+            ),
+            autoResume: true,
+            updatedAt: 100
+        )
+    }
+}

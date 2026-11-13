@@ -143,6 +143,149 @@ struct TerminalSurfaceStartupRestorePolicyTests {
         #expect(surface.suppressConfiguredInitialInput)
     }
 
+    @Test("Accepted runtime failure consumes an already staged restore once")
+    func acceptedRuntimeFailureConsumesStagedInputOnce() {
+        let nativeView = FakeTerminalSurfaceNativeView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let paneHost = FakeTerminalSurfacePaneHost(surfaceView: nativeView, attachesThroughSurfaceModel: true)
+        let surface = makeSurface(
+            policy: .pacedSessionRestore.requiringStartupRestoreAdmission(),
+            scheduler: RecordingRestoreSpawnScheduler(),
+            nativeView: nativeView,
+            paneHost: paneHost
+        )
+        defer { surface.closeHeadlessStartupWindowIfNeeded() }
+        let generation = surface.terminalLifecycleId
+        surface.nextRuntimeInitialInput = "original restore\n"
+        surface.startupInputGate.stage("original restore\n", generation: generation)
+        var generations: [UUID] = []
+        surface.onStartupRestoreAbandoned = { current in
+            generations.append(current)
+            return current == generation
+        }
+
+        surface.reportStartupRestoreRuntimeFailure()
+        surface.reportStartupRestoreRuntimeFailure()
+
+        #expect(generations == [generation])
+        #expect(surface.nextRuntimeInitialInput == nil)
+        #expect(surface.startupInputGate.takeForPrompt(generation: generation) == nil)
+        #expect(surface.suppressConfiguredInitialInput)
+        #expect(surface.hasStartupRestoreAdmissionCommandOverride)
+    }
+
+    @Test("Public cancellation notifies the selected generation and consumes queued input")
+    func publicCancellationNotifiesGenerationAndConsumesQueuedInput() {
+        let nativeView = FakeTerminalSurfaceNativeView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let paneHost = FakeTerminalSurfacePaneHost(surfaceView: nativeView, attachesThroughSurfaceModel: true)
+        let surface = makeSurface(
+            policy: .pacedSessionRestore.requiringStartupRestoreAdmission(),
+            scheduler: RecordingRestoreSpawnScheduler(),
+            nativeView: nativeView,
+            paneHost: paneHost
+        )
+        defer { surface.closeHeadlessStartupWindowIfNeeded() }
+        let generation = surface.terminalLifecycleId
+        surface.startupInputGate.stage("original restore\n", generation: generation)
+        var generations: [UUID] = []
+        surface.onStartupRestoreAbandoned = { current in
+            generations.append(current)
+            return true
+        }
+
+        surface.cancelStartupRestoreAdmission()
+        surface.cancelStartupRestoreAdmission()
+
+        #expect(generations == [generation])
+        #expect(surface.startupInputGate.takeForPrompt(generation: generation) == nil)
+        #expect(!surface.admitStartupRestoreRuntime(initialInput: "late restore\n"))
+        #expect(surface.suppressConfiguredInitialInput)
+    }
+
+    @Test("A rejected stale owner cannot cancel the current generation's input")
+    func rejectedStaleOwnerPreservesCurrentInput() {
+        let nativeView = FakeTerminalSurfaceNativeView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let paneHost = FakeTerminalSurfacePaneHost(surfaceView: nativeView, attachesThroughSurfaceModel: true)
+        let surface = makeSurface(
+            policy: .pacedSessionRestore.requiringStartupRestoreAdmission(),
+            scheduler: RecordingRestoreSpawnScheduler(),
+            nativeView: nativeView,
+            paneHost: paneHost
+        )
+        defer { surface.closeHeadlessStartupWindowIfNeeded() }
+        let oldGeneration = surface.terminalLifecycleId
+        surface.advanceTerminalLifecycleForRuntimeReplacement()
+        let currentGeneration = surface.terminalLifecycleId
+        #expect(currentGeneration != oldGeneration)
+        surface.nextRuntimeInitialInput = "new restore\n"
+        surface.startupInputGate.stage("new restore\n", generation: currentGeneration)
+        surface.onStartupRestoreAbandoned = { $0 == oldGeneration }
+
+        surface.reportStartupRestoreRuntimeFailure()
+
+        #expect(surface.nextRuntimeInitialInput == "new restore\n")
+        #expect(surface.startupInputGate.takeForPrompt(generation: currentGeneration) == "new restore\n")
+        #expect(!surface.suppressConfiguredInitialInput)
+    }
+
+    @Test("Input cancellation keeps the legacy deferred-owner notification")
+    func generationCancellationPreservesLegacyDeferredCallback() {
+        let nativeView = FakeTerminalSurfaceNativeView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let paneHost = FakeTerminalSurfacePaneHost(surfaceView: nativeView, attachesThroughSurfaceModel: true)
+        let surface = makeSurface(
+            policy: .pacedSessionRestore.requiringDeferredAgentResumeAdmission(),
+            scheduler: RecordingRestoreSpawnScheduler(),
+            nativeView: nativeView,
+            paneHost: paneHost
+        )
+        surface.agentCommandShimInstallCompleted = true
+        defer { surface.closeHeadlessStartupWindowIfNeeded() }
+        var selectedGenerations: [UUID] = []
+        var legacyCount = 0
+        surface.onStartupRestoreAbandoned = { generation in
+            selectedGenerations.append(generation)
+            return false
+        }
+        surface.onStartupRestoreAdmissionCancelled = { legacyCount += 1 }
+
+        surface.didReceiveExplicitInput()
+
+        #expect(selectedGenerations == [surface.terminalLifecycleId])
+        #expect(legacyCount == 1)
+        #expect(surface.suppressConfiguredInitialInput)
+    }
+
+    @Test("Runtime pacing and an unavailable app remain pending observations")
+    func pacingAndUninitializedRuntimeDoNotAbandonRestore() {
+        let nativeView = FakeTerminalSurfaceNativeView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let paneHost = FakeTerminalSurfacePaneHost(surfaceView: nativeView, attachesThroughSurfaceModel: true)
+        let scheduler = RecordingRestoreSpawnScheduler()
+        let surface = makeSurface(
+            policy: .pacedSessionRestore.requiringStartupRestoreAdmission(),
+            scheduler: scheduler,
+            nativeView: nativeView,
+            paneHost: paneHost
+        )
+        surface.agentCommandShimInstallCompleted = true
+        defer { surface.closeHeadlessStartupWindowIfNeeded() }
+        var abandonments = 0
+        surface.onStartupRestoreAbandoned = { _ in
+            abandonments += 1
+            return true
+        }
+        surface.nextRuntimeInitialInput = "pending restore\n"
+
+        surface.admitStartupRestoreRuntime()
+        #expect(abandonments == 0)
+        #expect(scheduler.scheduledSurfaceIds == [surface.id])
+        scheduler.runScheduledOperation()
+
+        // FakeTerminalEngine has no runtime app: this is a wait, not a failed native creation.
+        #expect(abandonments == 0)
+        #expect(surface.nextRuntimeInitialInput == "pending restore\n")
+        #expect(!surface.suppressConfiguredInitialInput)
+    }
+
+
     private func makeSurface(
         policy: TerminalSurfaceRuntimeSpawnPolicy,
         scheduler: RecordingRestoreSpawnScheduler,

@@ -70,6 +70,12 @@ extension DockSplitStore {
             // The user (or a socket client) took over the pane: never replay a
             // lost restore selector into a line they are typing.
             self.restoredAgentLifecycle.clearStartupInput(panelId: terminal.id)
+            if var binding = self.surfaceResumeBindingsByPanelId[terminal.id],
+               binding.retireRestoredProcessDetection(
+                    terminalLifecycleID: terminal.surface.terminalLifecycleId
+               ) {
+                self.surfaceResumeBindingsByPanelId[terminal.id] = binding
+            }
             _ = AppDelegate.shared?.notificationStore?.clearAgentAttentionNotification(
                 forTabId: self.workspaceId,
                 surfaceId: terminal.id
@@ -78,6 +84,19 @@ extension DockSplitStore {
                 tabId: self.workspaceId,
                 surfaceId: terminal.id
             )
+        }
+        terminal.surface.onStartupRestoreAbandoned = { [weak self, weak terminal] generation in
+            guard let self, let terminal,
+                  generation == terminal.surface.terminalLifecycleId,
+                  let mountedTerminal = self.panels[terminal.id] as? TerminalPanel,
+                  mountedTerminal === terminal,
+                  var binding = self.surfaceResumeBindingsByPanelId[terminal.id],
+                  binding.retireRestoredProcessDetection(terminalLifecycleID: generation) else {
+                return false
+            }
+            self.surfaceResumeBindingsByPanelId[terminal.id] = binding
+            self.restoredAgentLifecycle.clearStartupInput(panelId: terminal.id)
+            return true
         }
         terminal.surface.onStartupRestoreAdmissionCancelled = { [weak self, weak terminal] in
             guard let self, let terminal,

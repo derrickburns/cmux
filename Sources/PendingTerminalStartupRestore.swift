@@ -9,6 +9,8 @@ struct PendingTerminalStartupRestore {
     let snapshot: SessionRestorableAgentSnapshot?
     let manualResumeAvailable: Bool
     let willRunStartupInput: Bool
+    /// Process admission does not announce or retain an embedded agent lifecycle.
+    var willRunProcessInput = false
     /// Keeps a deferred ownership restore gated after topology commit. The
     /// shared live-agent scan must admit or cancel it later.
     let defersStartupRestoreAdmission: Bool
@@ -17,6 +19,6 @@ struct PendingTerminalStartupRestore {
     let ownedResumeLaunchClaim: SessionRestorableAgentSnapshot?
 
     var willRunStartupWork: Bool {
-        willRunStartupInput
+        willRunStartupInput || willRunProcessInput
     }
 }

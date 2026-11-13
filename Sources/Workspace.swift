@@ -1422,12 +1422,25 @@ extension Workspace {
         restorableAgentIndex: RestorableAgentSessionIndex? = nil
     ) {
         guard surfaceResumeBindingIndex.isAvailable else { return }; for panelId in panels.keys {
-            let storedBinding = surfaceResumeBindingsByPanelId[panelId]
+            var storedBinding = surfaceResumeBindingsByPanelId[panelId]
             let detectedBinding = surfaceResumeBindingIndex.binding(workspaceId: id, panelId: panelId)
             if surfaceResumeBindingIndex.hasAmbiguousPanel(panelId), detectedBinding == nil {
                 // A missing panel-only winner is uncertainty, not proof that a
                 // process-backed binding exited; preserve the existing binding.
                 continue
+            }
+
+            if var restoredBinding = storedBinding {
+                let previousObservation = restoredBinding.restoredProcessDetectionObservation
+                let preserves = restoredBinding.reconcileRestoredProcessDetection(
+                    detected: detectedBinding,
+                    detectionAvailable: true
+                )
+                if previousObservation != restoredBinding.restoredProcessDetectionObservation {
+                    surfaceResumeBindingsByPanelId[panelId] = restoredBinding
+                }
+                storedBinding = restoredBinding
+                if preserves { continue }
             }
 
             if let detectedBinding, detectedBinding.isPlainSSHProcessDetectedBinding {
@@ -1529,7 +1542,7 @@ extension Workspace {
         surfaceResumeBindingIndex: SurfaceResumeBindingIndex?,
         downgradeStoredProcessDetectedResumeBindingWhenDetectionUnavailable: Bool = false
     ) -> SurfaceResumeBindingSnapshot? {
-        let storedBinding = surfaceResumeBindingsByPanelId[panelId]
+        var storedBinding = surfaceResumeBindingsByPanelId[panelId]
         // An unavailable index (the synchronous update-relaunch save, or the
         // quit fallback after a timed-out fresh scan) carries no process
         // evidence. Treat it like a missing index so the binding the last
@@ -1557,6 +1570,18 @@ extension Workspace {
             // Keep an uncertain binding available for explicit manual resume,
             // but never carry process-detected auto-launch through ambiguity.
             return storedBinding?.disablingAutomaticResume()
+        }
+        if var restoredBinding = storedBinding {
+            let previousObservation = restoredBinding.restoredProcessDetectionObservation
+            let preserves = restoredBinding.reconcileRestoredProcessDetection(
+                detected: detectedBinding,
+                detectionAvailable: true
+            )
+            if previousObservation != restoredBinding.restoredProcessDetectionObservation {
+                surfaceResumeBindingsByPanelId[panelId] = restoredBinding
+            }
+            storedBinding = restoredBinding
+            if preserves { return restoredBinding }
         }
         guard let storedBinding else { return detectedBinding }
         guard let detectedBinding else {
@@ -1999,6 +2024,8 @@ extension Workspace {
                 restoredAgentResumeLaunch?.initialInput != nil ||
                 (restoredBindingLaunch?.initialInput != nil && resumeBinding?.isAgentHookBinding == true) ||
                 deferredAgentResumeStartupInput != nil
+            let restoredProcessWillRunStartupInput =
+                restoredBindingLaunch?.initialInput != nil && resumeBinding?.isProcessDetected == true
 #if DEBUG
             if let restorableAgent {
                 let sessionPreview = String(restorableAgent.sessionId.prefix(8))
@@ -2051,7 +2078,7 @@ extension Workspace {
                 startupEnvironment: replayEnvironment,
                 runtimeSpawnPolicy: terminalStartupRestoreCoordinator.runtimeSpawnPolicy(
                     requestedPolicy: .pacedSessionRestore,
-                    willRunStartupInput: restoredAgentWillRunStartupInput,
+                    willRunStartupInput: restoredAgentWillRunStartupInput || restoredProcessWillRunStartupInput,
                     awaitsDeferredAgentResume: deferredAgentResumeAdmission
                 ),
                 remotePTYSessionID: restoredRemotePTYSessionID,
@@ -2111,6 +2138,12 @@ extension Workspace {
                     restoredBinding,
                     panelId: terminalPanel.id
                 ) {
+                    var restoredBinding = restoredBinding
+                    if restoredBindingLaunch?.initialInput != nil {
+                        restoredBinding.armRestoredProcessDetectionObservation(
+                            terminalLifecycleID: terminalPanel.surface.terminalLifecycleId
+                        )
+                    }
                     surfaceResumeBindingsByPanelId[terminalPanel.id] = restoredBinding
                 }
                 if restoredBinding.isPlainSSHProcessDetectedBinding,
@@ -2162,6 +2195,7 @@ extension Workspace {
                 // would invite a second writer.
                 manualResumeAvailable: restorableAgent != nil && !suppressesResumeForBackgroundSession,
                 willRunStartupInput: restoredAgentWillRunStartupInput,
+                willRunProcessInput: restoredProcessWillRunStartupInput,
                 resumeWorkingDirectory: restoredDirectoryIsLocalPath
                     ? resumeSessionWorkingDirectory
                     : nil,
@@ -6271,7 +6305,19 @@ final class Workspace: Identifiable, ObservableObject, FilePreviewTabMetadataHos
         guard panels[panelId] != nil else { return }
         let previousState = panelShellActivityStates[panelId] ?? .unknown
 
-        if surfaceResumeBindingsByPanelId[panelId]?.isPlainSSHProcessDetectedBinding == true {
+        if var restoredBinding = surfaceResumeBindingsByPanelId[panelId],
+           let terminal = panels[panelId] as? TerminalPanel {
+            let previousObservation = restoredBinding.restoredProcessDetectionObservation
+            restoredBinding.observeRestoredProcessDetectionShellState(
+                state,
+                terminalLifecycleID: terminal.surface.terminalLifecycleId
+            )
+            if previousObservation != restoredBinding.restoredProcessDetectionObservation {
+                surfaceResumeBindingsByPanelId[panelId] = restoredBinding
+            }
+        }
+        if surfaceResumeBindingsByPanelId[panelId]?.isPlainSSHProcessDetectedBinding == true,
+           surfaceResumeBindingsByPanelId[panelId]?.restoredProcessDetectionObservation == nil {
             switch state {
             case .commandRunning:
                 // The restored/manual SSH command reached the foreground.

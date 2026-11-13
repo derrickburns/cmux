@@ -483,6 +483,7 @@ extension DockSplitStore {
             agentLaunch?.initialInput != nil ||
             (bindingLaunch?.initialInput != nil && resumeBinding?.isAgentHookBinding == true) ||
             deferredAgentResumeStartupInput != nil
+        let willRunProcessInput = bindingLaunch?.initialInput != nil && resumeBinding?.isProcessDetected == true
         let startupHandlesWorkingDirectory =
             tmuxLauncher != nil || agentLaunch != nil || bindingLaunch != nil ||
             deferredAgentResumeStartupInput != nil
@@ -532,7 +533,7 @@ extension DockSplitStore {
             isRemoteTerminal: terminalSnapshot.isRemoteTerminal == true,
             runtimeSpawnPolicy: terminalStartupRestoreCoordinator.runtimeSpawnPolicy(
                 requestedPolicy: .pacedSessionRestore,
-                willRunStartupInput: willRunAgentInput,
+                willRunStartupInput: willRunAgentInput || willRunProcessInput,
                 awaitsDeferredAgentResume: deferredAgentResumeAdmission
             )
         )
@@ -558,7 +559,13 @@ extension DockSplitStore {
         }
         if let resumeBinding {
             if surfaceResumeBindingMutationAllowed(resumeBinding, panelId: terminal.id) {
-                surfaceResumeBindingsByPanelId[terminal.id] = resumeBinding
+                var restoredBinding = resumeBinding
+                if bindingLaunch?.initialInput != nil {
+                    restoredBinding.armRestoredProcessDetectionObservation(
+                        terminalLifecycleID: terminal.surface.terminalLifecycleId
+                    )
+                }
+                surfaceResumeBindingsByPanelId[terminal.id] = restoredBinding
             }
         }
         if let managedResumeBinding {
@@ -576,6 +583,7 @@ extension DockSplitStore {
             manualResumeAvailable: !suppressesResumeForBackgroundSession && (restorableAgent != nil ||
                 (managedResumeBinding ?? resumeBinding)?.isAgentHookBinding == true),
             willRunStartupInput: willRunAgentInput,
+            willRunProcessInput: willRunProcessInput,
             resumeWorkingDirectory: resumeSessionWorkingDirectory,
             agentSessionAlreadyActive: liveSessionOwner != nil ||
                 suppressesResumeForBackgroundSession ||

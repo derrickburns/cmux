@@ -337,6 +337,10 @@ public final class TerminalSurface: Identifiable, ObservableObject {
     @MainActor public var sharingViewDetached = false
     /// Notifies the owner when explicit input cancels a deferred auto-resume.
     @MainActor public var onStartupRestoreAdmissionCancelled: (@MainActor () -> Void)?
+    /// Native creation failed or a staged command was cancelled, with its exact generation.
+    /// Return true only when the owner retired that generation's startup intent.
+    @MainActor public var onStartupRestoreAbandoned: (@MainActor (UUID) -> Bool)?
+    @MainActor var reportedStartupRestoreRuntimeFailureGeneration: UUID?
     /// Called after durable font-size lineage changes.
     @MainActor public var onFontSizeLineageChanged: (@MainActor (TerminalFontSizeLineage) -> Void)?
     @MainActor var manualSizeReportPendingWindowAttach = false

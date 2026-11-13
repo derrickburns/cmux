@@ -61,6 +61,7 @@ final class TerminalStartupRestoreCoordinator {
     ///   - resumeBinding: Hook-owned fallback identity for snapshots without an agent payload.
     ///   - manualResumeAvailable: Whether the terminal retains a manual continuation.
     ///   - willRunStartupInput: Whether an agent restore selector is queued as terminal input.
+    ///   - willRunProcessInput: Whether an independent process restore needs terminal admission.
     ///   - resumeWorkingDirectory: Working directory owned by the resumed agent launch.
     ///   - chatWorkingDirectory: Working directory used to resolve the resumed transcript.
     ///   - agentSessionAlreadyActive: Whether another surface already owns the live session.
@@ -73,6 +74,7 @@ final class TerminalStartupRestoreCoordinator {
         resumeBinding: SurfaceResumeBindingSnapshot? = nil,
         manualResumeAvailable: Bool,
         willRunStartupInput: Bool,
+        willRunProcessInput: Bool = false,
         resumeWorkingDirectory: String?,
         chatWorkingDirectory: String? = nil,
         agentSessionAlreadyActive: Bool = false,
@@ -85,6 +87,7 @@ final class TerminalStartupRestoreCoordinator {
             snapshot: snapshot,
             manualResumeAvailable: manualResumeAvailable,
             willRunStartupInput: willRunStartupInput,
+            willRunProcessInput: willRunProcessInput,
             defersStartupRestoreAdmission: defersStartupRestoreAdmission,
             resumeWorkingDirectory: resumeWorkingDirectory,
             chatResumeBinding: chatResumeBinding(
