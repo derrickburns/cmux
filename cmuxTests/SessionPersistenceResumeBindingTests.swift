@@ -1074,6 +1074,54 @@ struct ProcessDetectedStartupOwnershipTests {
         }
     }
 
+    @Test(arguments: [DockScope.workspace, .global], ["tmux", "ssh"])
+    func unownedDockProcessStillUsesItsManagedAgentFallback(scope: DockScope, kind: String) throws {
+        for ownership in ["unarmed", "foreignGeneration", "changedCommand"] {
+            let source = Workspace()
+            defer { source.teardownAllPanels() }
+            let destination = Workspace()
+            defer { destination.teardownAllPanels() }
+            let terminal = try stagedTerminal(in: source, kind: kind)
+            let original = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+            let transfer = try #require(source.detachSurface(panelId: terminal.id))
+            let dock = DockSplitStore(workspaceId: UUID(), scope: scope, baseDirectoryProvider: { "/tmp" })
+            defer { dock.closeAllPanels() }
+            let dockPane = try #require(dock.bonsplitController.allPaneIds.first)
+            let panelID = try #require(dock.attachDetachedSurface(transfer, inPane: dockPane, focus: false))
+            let managed = SurfaceResumeBindingSnapshot(
+                kind: "custom-agent",
+                command: "custom-agent --resume managed-original",
+                cwd: "/tmp",
+                checkpointId: "managed-original",
+                source: "agent-hook",
+                autoResume: false,
+                approvalPolicy: .manual,
+                updatedAt: 101
+            )
+            let acceptedManagedBinding = dock.setSurfaceResumeBinding(managed, panelId: panelID)
+            #expect(acceptedManagedBinding)
+            var unowned = binding(kind: kind)
+            if ownership == "foreignGeneration" {
+                unowned.armRestoredProcessDetectionObservation(terminalLifecycleID: UUID())
+            } else if ownership == "changedCommand" {
+                unowned = original
+                unowned.command += " --changed-invocation"
+            }
+            dock.surfaceResumeBindingsByPanelId[panelID] = unowned
+            let detached = try #require(dock.detachSurface(panelId: panelID))
+            #expect(detached.resolvedManagedAgentResumeBinding == managed)
+            let destinationPane = try #require(destination.bonsplitController.allPaneIds.first)
+            let adoptedPanelID = try #require(destination.attachDetachedSurface(
+                detached,
+                inPane: destinationPane,
+                focus: false
+            ))
+
+            #expect(destination.surfaceResumeBinding(panelId: adoptedPanelID) == managed)
+            #expect(terminal.surface.onStartupRestoreAbandoned?(terminal.surface.terminalLifecycleId) == false)
+        }
+    }
+
     @Test(arguments: [DockScope.workspace, .global], ["missing", "unavailable"])
     func recoveryFreezeDowngradesEvenAnOwnedQueuedDockRestore(scope: DockScope, detection: String) throws {
         let source = Workspace()

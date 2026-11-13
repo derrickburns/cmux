@@ -512,7 +512,11 @@ extension DockSplitStore {
         detectionUnavailable: Bool = false
     ) -> SurfaceResumeBindingSnapshot? {
         var stored = surfaceResumeBindingsByPanelId[panelId]
-        if !detectedIsAmbiguous, var restoredBinding = stored {
+        // Explicit teardown recovery must remove automatic authority even
+        // while startup is queued. Ordinary missing scans still retain custody.
+        if !detectedIsAmbiguous,
+           !(downgradeStoredProcessDetectedResumeBindingWhenDetectionUnavailable && detected == nil),
+           var restoredBinding = stored {
             let previousObservation = restoredBinding.restoredProcessDetectionObservation
             let preserves = restoredBinding.reconcileRestoredProcessDetection(
                 detected: detected,

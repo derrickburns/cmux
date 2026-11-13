@@ -11838,9 +11838,24 @@ final class Workspace: Identifiable, ObservableObject, FilePreviewTabMetadataHos
             surfaceId: detached.panelId
         )
         let transferredResumeBinding: SurfaceResumeBindingSnapshot? = {
-            if let resumeBinding = detached.resumeBinding,
-               !resumeBinding.isProcessDetected {
-                return resumeBinding
+            if let resumeBinding = detached.resumeBinding {
+                if !resumeBinding.isProcessDetected {
+                    return resumeBinding
+                }
+                if let observation = resumeBinding.restoredProcessDetectionObservation,
+                   let terminal = detached.panel as? TerminalPanel,
+                   observation.terminalLifecycleID == terminal.surface.terminalLifecycleId,
+                   observation.owns(resumeBinding) {
+                    return resumeBinding
+                }
+                // Persisted manual recovery has no process-local observation,
+                // but still owns its exact command without an automatic grant.
+                if resumeBinding.restoredProcessDetectionObservation == nil,
+                   resumeBinding.autoResume == false,
+                   resumeBinding.approvalPolicy == .manual,
+                   resumeBinding.approvalRecordId == nil {
+                    return resumeBinding
+                }
             }
             return detached.resolvedManagedAgentResumeBinding
         }()
