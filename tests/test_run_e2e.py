@@ -7,6 +7,7 @@ import re
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -1219,6 +1220,78 @@ class FocusedLauncherTests(unittest.TestCase):
         self.assertEqual(len(guard_reads), 1, guard_reads)
 
 
+
+
+class FrameOwnerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("repository_frames", ROOT / "scripts/ci/e2e-frames.py")
+        cls.frames = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.frames)
+
+    def test_run_url_retains_its_repository_and_scopes_default_output(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(sys, "argv", ["e2e-frames.py", "https://github.com/derrickburns/cmux/actions/runs/123", "--json"]), \
+                mock.patch.object(self.frames.tempfile, "gettempdir", return_value=directory), \
+                mock.patch.object(self.frames, "download", return_value=True) as download, \
+                mock.patch.object(self.frames, "load_built", return_value=[]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(self.frames.main(), 0)
+        run_id, repository, _, output = download.call_args.args
+        self.assertEqual((run_id, repository), ("123", "derrickburns/cmux"))
+        self.assertEqual(output, Path(directory) / "cmux-ui-frames/derrickburns/cmux/123")
+
+    def test_conflicting_run_url_or_invalid_repository_refuses_before_download(self):
+        for source, repository in [
+            ("https://github.com/manaflow-ai/cmux/actions/runs/123", "derrickburns/cmux"),
+            ("https://example.org/manaflow-ai/cmux/actions/runs/123", "manaflow-ai/cmux"),
+            ("123", "owner/../repo"),
+        ]:
+            with self.subTest(source=source, repository=repository), \
+                    mock.patch.object(sys, "argv", ["e2e-frames.py", source, "--repo", repository, "--json"]), \
+                    mock.patch.object(self.frames, "download", return_value=True) as download, \
+                    mock.patch.object(self.frames, "load_built", return_value=[]), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit):
+                    self.frames.main()
+                download.assert_not_called()
+
+    def test_marker_cannot_reuse_another_repository_or_run_original(self):
+        for repository, run_id in [("derrickburns/cmux", "123"), ("manaflow-ai/cmux", "124")]:
+            with self.subTest(repository=repository, run_id=run_id), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(self.frames.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                output = Path(directory) / "output"
+                self.assertTrue(self.frames.download("123", "manaflow-ai/cmux", "ui-frames", output))
+                with self.assertRaises(ValueError):
+                    self.frames.download(run_id, repository, "ui-frames", output)
+                self.assertEqual(run.call_count, 1)
+
+    def test_legacy_or_unowned_nonempty_output_is_not_adopted(self):
+        for filename in (".downloaded-ui-frames", "summary.json"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(self.frames.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                output = Path(directory)
+                original = output / filename
+                original.write_text("original unbound bytes")
+                with self.assertRaises(ValueError):
+                    self.frames.download("123", "derrickburns/cmux", "ui-frames", output)
+                run.assert_not_called()
+                self.assertEqual(original.read_text(), "original unbound bytes")
+
+    def test_owned_marker_reuses_only_the_exact_original_without_downloading_again(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.frames.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            output = Path(directory) / "output"
+            for _ in range(2):
+                self.assertTrue(self.frames.download("123", "derrickburns/cmux", "ui-frames", output))
+            self.assertEqual(run.call_count, 1)
+
+    def test_failed_download_does_not_admit_success(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.frames.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+            output = Path(directory) / "output"
+            self.assertFalse(self.frames.download("123", "derrickburns/cmux", "ui-frames", output))
+            self.assertFalse((output / ".downloaded-ui-frames").exists())
 
 
 class RepositoryOwnerTests(unittest.TestCase):
