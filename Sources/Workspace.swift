@@ -4448,7 +4448,7 @@ final class Workspace: Identifiable, ObservableObject, FilePreviewTabMetadataHos
                 workingDirectory: hasWorkingDirectory ? trimmedWorkingDirectory : nil,
                 portOrdinal: portOrdinal,
                 initialCommand: initialTerminalCommand,
-                tmuxStartCommand: sessionRestorePolicy.localTmuxStartCommand(initialTerminalTmuxStartCommand),
+                tmuxStartCommand: self.sessionRestorePolicy.localTmuxStartCommand(initialTerminalTmuxStartCommand),
                 initialInput: initialTerminalInput,
                 initialEnvironmentOverrides: Self.startupEnvironment(
                     workspaceEnvironment: sanitizedWorkspaceEnvironment,
