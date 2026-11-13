@@ -259,7 +259,7 @@ class FocusedLauncherTests(unittest.TestCase):
                 self.assertEqual(self.dispatch()["ref"], HEAD)
 
     PR_CI = {"id": 500, "path": ".github/workflows/ci.yml", "event": "pull_request", "status": "completed",
-             "head_sha": HEAD, "created_at": "2026-09-25T00:00:00Z", "html_url": "https://x/runs/500",
+             "head_sha": HEAD, "created_at": "2026-09-25T00:00:00Z", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500",
              "head_repository": {"full_name": "manaflow-ai/cmux"},
              "referenced_workflows": [{"ref": "refs/pull/7/merge", "sha": MERGE}]}
     PRODUCTS = [{"id": 7, "name": "app-host-products-v1-k-1", "expired": False}]
@@ -2123,7 +2123,7 @@ class CIProductReuseTests(unittest.TestCase):
         self.run_command = mock.patch.object(self.dispatch.subprocess, "run").start()
         self.addCleanup(mock.patch.stopall)
         self.find_run = mock.patch.object(
-            self.dispatch, "find_run", return_value={"databaseId": 9, "url": "https://x/runs/9"}
+            self.dispatch, "find_run", return_value={"databaseId": 9, "url": "https://github.com/manaflow-ai/cmux/actions/runs/9"}
         ).start()
         mock.patch.object(self.dispatch, "wait_for_retry", return_value=False).start()
 
@@ -2149,7 +2149,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_ci_still_compiling_the_commit_is_awaited_not_duplicated(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-              "event": "pull_request", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "pull_request", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         artifacts = iter([None, self.PRODUCTS])
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: (
@@ -2167,7 +2167,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_a_merge_that_moved_app_code_is_not_awaited(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-              "event": "pull_request", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "pull_request", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: {"workflow_runs": [ci]}
         with mock.patch.object(self.dispatch, "planned_products", return_value=None), \
@@ -2180,7 +2180,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_ci_that_finishes_without_products_falls_back_to_a_full_build(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "queued",
-              "event": "push", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "push", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: (
             {"workflow_runs": [ci]} if "head_sha=" in path else {"status": "completed"}
@@ -2194,7 +2194,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_ci_that_skips_its_macos_compile_is_not_awaited(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-              "event": "workflow_dispatch", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "workflow_dispatch", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: (
             {"workflow_runs": [ci]} if "head_sha=" in path
@@ -2217,7 +2217,7 @@ class CIProductReuseTests(unittest.TestCase):
         for conclusion in ("failure", "cancelled", "success"):
             with self.subTest(conclusion):
                 ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-                      "event": "workflow_dispatch", "html_url": "https://x/runs/500", "head_sha": HEAD}
+                      "event": "workflow_dispatch", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
                 rerun = self.dispatch.rerun
                 rerun.gh_api.side_effect = lambda path, ci=ci, conclusion=conclusion: (
                     {"workflow_runs": [ci]} if "head_sha=" in path
@@ -2235,7 +2235,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_ci_whose_compile_admission_is_still_running_is_awaited(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-              "event": "workflow_dispatch", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "workflow_dispatch", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: (
             {"workflow_runs": [ci]} if "head_sha=" in path
