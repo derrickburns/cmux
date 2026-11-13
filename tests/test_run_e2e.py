@@ -485,6 +485,18 @@ class FocusedLauncherTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.calls(), [])
 
+    def test_fork_history_rejects_foreign_receipts_and_reuses_the_owned_original(self):
+        foreign = json.loads(self._live(runner="macos-26"))[0]
+        owned = {**foreign, "url": "https://github.com/derrickburns/cmux/actions/runs/777"}
+        for history, reuses in [(foreign, False), (owned, True)]:
+            with self.subTest(reuses=reuses):
+                (self.root / "dispatch.json").unlink(missing_ok=True)
+                result = self.launch("cmuxTests/ExampleTests", "--repository", "derrickburns/cmux",
+                                     LAUNCHER_PRIOR_RUNS=json.dumps([history]))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("reusing" in result.stdout, reuses, result.stdout)
+                self.assertEqual((self.root / "dispatch.json").exists(), not reuses)
+
     def test_explicit_runner_reaches_the_workflow_dispatch(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/test-e2e.yml").read_text())
         choices = workflow["on" if "on" in workflow else True]["workflow_dispatch"]["inputs"]["runner"]["options"]
@@ -1344,6 +1356,30 @@ class RepositoryOwnerTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("--repo", command)
         self.assertEqual(command[command.index("--repo") + 1], "derrickburns/cmux")
+
+    def test_rerun_dispatch_retains_the_product_source_repository(self):
+        source = {"source_run_id": "321", "source_sha": HEAD, "runner": "macos-26"}
+        receipt = {"databaseId": 123, "url": "https://github.com/derrickburns/cmux/actions/runs/123"}
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch, "fetch_selected_commit"), \
+                mock.patch.object(self.dispatch, "planned_products", return_value=source), \
+                mock.patch.object(self.dispatch, "find_run", return_value=receipt), \
+                mock.patch.object(self.dispatch.subprocess, "run") as run, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(self.dispatch.reuse_ci_products(HEAD, ["cmuxTests/ExampleTests"], None, False), 0)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--repo") + 1], "derrickburns/cmux")
+        self.assertIn("source_repository=derrickburns/cmux", command)
+
+    def test_fork_product_family_uses_only_its_hosted_producer(self):
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch.rerun, "gh_api") as api, \
+                mock.patch.object(self.dispatch, "listed_variables", side_effect=AssertionError("queried provider variables")):
+            for label, expected in [("macos-26", "macos-26"), (MINI, None), (SMALL, None)]:
+                with self.subTest(label=label):
+                    api.return_value = {"jobs": [{"name": self.dispatch.rerun.ADMISSION_JOB, "labels": [label]}]}
+                    self.assertEqual(self.dispatch.product_family({"id": 123}), expected)
+                    self.assertIn("repos/derrickburns/cmux/actions/runs/123/", api.call_args.args[0])
 
 
 class RunDiscoveryTests(unittest.TestCase):

@@ -28,7 +28,8 @@ import e2e_runner_pool as pool  # noqa: E402
 import machine_failure  # noqa: E402
 from e2e_runner_pool import SMALL_RUNNER  # noqa: E402
 
-REPO = "manaflow-ai/cmux"
+DEFAULT_REPOSITORY = "manaflow-ai/cmux"
+REPO = DEFAULT_REPOSITORY
 WORKFLOW = "test-e2e.yml"
 # Runs cmuxTests against app-host products a CI run already compiled; see
 # reuse_ci_products().
@@ -99,6 +100,19 @@ def _load_selectors():
 
 
 selectors = _load_selectors()
+
+
+def hosted_fork() -> bool:
+    """Mirror test-e2e.yml's repository-owner branch before provider queries."""
+    return REPO.split("/", 1)[0].casefold() != "manaflow-ai"
+
+
+def owned_run(run: dict) -> bool:
+    return rerun.belongs_to_repository(run, REPO, resource="actions/runs/")
+
+
+def fetch_selected_commit(revision: str) -> None:
+    rerun.fetch_commit(revision, repository=REPO)
 
 
 def normalize_entry(entry: str, root: Path = ROOT) -> tuple[str, str | None]:
@@ -245,7 +259,7 @@ def recent_dispatches(workflow_ref: str) -> list[dict]:
         return []
     if not isinstance(runs, list):
         return []
-    return [run for run in runs if isinstance(run, dict)]
+    return [run for run in runs if owned_run(run)]
 
 
 def parse_run_name(title: str) -> tuple[list[str], str, str] | None:
@@ -302,6 +316,8 @@ def repository_variable(name: str, env_name: str) -> str | None:
     gets the default. Elsewhere an unreadable listing also means the default:
     overflow is still bounded by the queue it reads, and fails to 6vcpu.
     """
+    if hosted_fork():
+        return None
     if env_name in os.environ:
         return os.environ[env_name]
     if VARIABLE_ENV in os.environ:
@@ -358,6 +374,8 @@ def default_runner() -> str | None:
     passes `vars.MACOS_RUNNER_TESTS` in CMUX_MACOS_RUNNER_TESTS instead. Set
     and empty means the variable is unset, and the literal decides.
     """
+    if hosted_fork():
+        return "macos-26"
     if VARIABLE_ENV in os.environ:
         value = os.environ[VARIABLE_ENV].strip()
         if value:
@@ -385,6 +403,8 @@ def routed_runner(default: str | None, test_target: str | None = None) -> str | 
     Only called when a dispatch is about to happen, so a run reused from the
     history spends no API calls on the queue.
     """
+    if hosted_fork():
+        return "macos-26"
     now = dt.datetime.now(dt.timezone.utc)
     return pool.auto_runner(
         default,
@@ -526,8 +546,9 @@ def watchable(run: dict) -> bool:
     An entry without an id or a URL cannot be attached to or named, and these
     guards never become a gate: a caller that cannot be redirected is dispatched.
     """
-    return (isinstance(run.get("databaseId"), int)
-            and bool(str(run.get("url", "")).strip()))
+    return (isinstance(run.get("databaseId"), int) and not isinstance(run["databaseId"], bool)
+            and run["databaseId"] > 0 and bool(str(run.get("url", "")).strip())
+            and owned_run(run))
 
 
 def find_run(
@@ -561,7 +582,7 @@ def find_run(
         ))
         if cancel_event.is_set():
             raise ValueError("focused-run discovery cancelled")
-        matches = [run for run in runs if ours(run["displayTitle"])]
+        matches = [run for run in runs if owned_run(run) and ours(run["displayTitle"])]
         if len(matches) == 1:
             return matches[0]
         if matches:
@@ -601,7 +622,10 @@ def planned_products(commit: str, only_testing: str, source_run_id: str = "") ->
     )
     try:
         with chdir(ROOT):
-            return rerun.plan(args)
+            found = rerun.plan(args)
+        if hosted_fork() and found.get("runner") != "macos-26":
+            return None
+        return found
     except SystemExit as error:
         print(f"note: no reusable CI products: {str(error).splitlines()[0]}", file=sys.stderr, flush=True)
     except (KeyError, ValueError, subprocess.CalledProcessError, json.JSONDecodeError):
@@ -623,12 +647,12 @@ def building_producer(commit: str) -> dict | None:
     except (subprocess.CalledProcessError, json.JSONDecodeError):
         runs = []
     for run in runs:
-        if (run.get("path") != CI_WORKFLOW_PATH or run.get("status") not in UNFINISHED
+        if (not owned_run(run) or run.get("path") != CI_WORKFLOW_PATH or run.get("status") not in UNFINISHED
                 or run.get("event") not in ("push", "pull_request", "workflow_dispatch")):
             continue
         try:
             with chdir(ROOT):
-                if rerun.non_test_changes(rerun.built_revision(run), commit):
+                if rerun.non_test_changes(rerun.built_revision(run, fetch=fetch_selected_commit), commit):
                     continue
         except (KeyError, ValueError, subprocess.CalledProcessError):
             continue
@@ -683,6 +707,8 @@ def wait_for_products(producer: dict, still_wanted: Callable[[], bool] = lambda:
             if rerun.products_artifact(REPO, str(producer["id"]), rerun.gh_api):
                 return True
             state = rerun.gh_api(f"repos/{REPO}/actions/runs/{producer['id']}")
+            if not owned_run(state):
+                raise ValueError("CI product receipt belongs to another repository")
             if state.get("status") not in UNFINISHED:
                 print(f"note: {producer['url']} finished without app-host products", file=sys.stderr, flush=True)
                 return False
@@ -742,13 +768,13 @@ def ui_product_source(commit: str) -> dict | None:
         # product (reuse_app_host_products.TRUSTED_WORKFLOWS). Main's ci.yml
         # runs are dispatches, and main's own product comes from
         # seed-derived-data.yml, which test-e2e.yml finds by itself.
-        if (run.get("path") != CI_WORKFLOW_PATH or run.get("event") != "pull_request"
+        if (not owned_run(run) or run.get("path") != CI_WORKFLOW_PATH or run.get("event") != "pull_request"
                 or not run.get("id")
                 or str((run.get("head_repository") or {}).get("full_name", "")).casefold() != REPO.casefold()):
             continue
         try:
             with chdir(ROOT):
-                built = rerun.built_revision(run)
+                built = rerun.built_revision(run, fetch=fetch_selected_commit)
         except (KeyError, ValueError, subprocess.CalledProcessError):
             continue
         source = {"revision": built, "id": run["id"], "url": run.get("html_url", ""), "ready": False}
@@ -814,6 +840,8 @@ def product_family(source: dict) -> str | None:
         if not job.get("name", "").endswith(rerun.ADMISSION_JOB):
             continue
         labels = job.get("labels") or []
+        if hosted_fork():
+            return "macos-26" if "macos-26" in labels else (None if labels else "")
         owned = [label for label in labels if owned_class(label)]
         if owned:
             # Only while UI runs may take an owned Mac at all (e2e_runner_pool).
@@ -867,7 +895,7 @@ def reuse_ci_products(commit: str, entries: list[str], workflow_ref: str | None,
         return None
     try:
         with chdir(ROOT):
-            rerun.fetch_commit(commit)
+            fetch_selected_commit(commit)
     except subprocess.CalledProcessError:
         return None
     try:
@@ -889,6 +917,7 @@ def reuse_ci_products(commit: str, entries: list[str], workflow_ref: str | None,
         "ref": commit,
         "only_testing": only_testing,
         "source_run_id": found["source_run_id"],
+        "source_repository": REPO,
         "dispatch_id": dispatch_id,
     }.items():
         command.extend(["-f", f"{key}={value}"])
@@ -958,6 +987,7 @@ def encode_scenario(path: Path) -> str:
 
 
 def main() -> int:
+    global REPO, _listed
     parser = argparse.ArgumentParser(
         description="Run one suite or method on an exact pushed commit. "
         "This focused result does not replace the full CI merge checks.",
@@ -974,6 +1004,8 @@ def main() -> int:
         "cmuxUITests/FuzzRegressions replays the UI fuzzer's checked-in repros (dogfood/fuzz/regressions) "
         "against the app, after any UI classes named with it.",
     )
+    parser.add_argument("--repository", type=rerun.repository_name, default=DEFAULT_REPOSITORY,
+                        help="explicit OWNER/NAME (default: manaflow-ai/cmux; personal forks use hosted macos-26)")
     parser.add_argument("--ref", help="remote branch, tag, or SHA; default: clean local HEAD, already pushed")
     parser.add_argument("--wait", action="store_true", help="wait and return a nonzero status if the run fails")
     parser.add_argument("--no-video", action="store_true")
@@ -1022,6 +1054,11 @@ def main() -> int:
         "or is already running there",
     )
     args = parser.parse_args()
+    REPO = args.repository
+    _listed = _UNLISTED
+    UNLOADABLE_SOURCES.clear()
+    if hosted_fork() and args.runner not in (None, "auto"):
+        parser.error("personal-fork workflows require --runner auto; the workflow selects GitHub-hosted macos-26")
     if args.frames:
         args.wait = True
     scenario_b64 = ""
@@ -1276,7 +1313,7 @@ def main() -> int:
         elif not (runner and pool.pr_runner_pool.persistent(runner) and runner in OVERFLOW_POOLS):
             runner = family
         print(f"Runner: {runner}, the pool family that compiled {commit}'s products", flush=True)
-    if not pinned:
+    if not pinned and not hosted_fork():
         # Last, over the family too: a Blacksmith product the owned Macs cannot
         # adopt only costs a compile, while Blacksmith cannot run UI tests.
         runner = pool.ui_owned_runner(
@@ -1336,7 +1373,7 @@ def watch_and_extract(run_id: int, frames: bool) -> int:
     status = watch_run(run_id)
     if frames and status != 130:  # not after an interrupt
         subprocess.run(
-            [sys.executable, str(Path(__file__).resolve().parent / "e2e-frames.py"), str(run_id)],
+            [sys.executable, str(Path(__file__).resolve().parent / "e2e-frames.py"), str(run_id), "--repo", REPO],
             cwd=ROOT,
             check=False,
         )
