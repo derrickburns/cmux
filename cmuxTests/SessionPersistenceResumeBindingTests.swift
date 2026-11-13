@@ -975,6 +975,166 @@ struct ProcessDetectedStartupOwnershipTests {
         #expect(dock.surfaceResumeBindingsByPanelId[panelID]?.autoResume == false)
     }
 
+    @Test(arguments: ["workspace", "workspaceDock", "globalDock"], ["tmux", "ssh"])
+    func processRestoreCustodyFollowsEveryTransferIntoWorkspace(origin: String, kind: String) throws {
+        for phase in ["queued", "manual", "persistedManual"] {
+            let source = Workspace()
+            defer { source.teardownAllPanels() }
+            let destination = Workspace()
+            defer { destination.teardownAllPanels() }
+            let terminal = try stagedTerminal(in: source, kind: kind)
+            if phase != "queued" {
+                terminal.surface.cancelStartupRestoreAdmission()
+            }
+            if phase == "persistedManual" {
+                let manual = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+                source.surfaceResumeBindingsByPanelId[terminal.id] = try JSONDecoder().decode(
+                    SurfaceResumeBindingSnapshot.self,
+                    from: JSONEncoder().encode(manual)
+                )
+            }
+            let original = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+            let generation = terminal.surface.terminalLifecycleId
+            var previousOwner = terminal.surface.onStartupRestoreAbandoned
+            var transfer = try #require(source.detachSurface(panelId: terminal.id))
+            var dock: DockSplitStore?
+            defer { dock?.closeAllPanels() }
+            if origin != "workspace" {
+                let owner = DockSplitStore(
+                    workspaceId: UUID(),
+                    scope: origin == "globalDock" ? .global : .workspace,
+                    baseDirectoryProvider: { "/tmp" }
+                )
+                dock = owner
+                let pane = try #require(owner.bonsplitController.allPaneIds.first)
+                let dockPanelID = try #require(owner.attachDetachedSurface(transfer, inPane: pane, focus: false))
+                previousOwner = terminal.surface.onStartupRestoreAbandoned
+                transfer = try #require(owner.detachSurface(panelId: dockPanelID))
+            }
+            let pane = try #require(destination.bonsplitController.allPaneIds.first)
+            let panelID = try #require(destination.attachDetachedSurface(transfer, inPane: pane, focus: false))
+
+            #expect(terminal.surface.terminalLifecycleId == generation)
+            #expect(previousOwner?(generation) == false)
+            let adopted = try #require(destination.surfaceResumeBinding(panelId: panelID))
+            #expect(adopted == original)
+            #expect(adopted.restoredProcessDetectionObservation == original.restoredProcessDetectionObservation)
+            for _ in 0..<8 {
+                _ = destination.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
+            }
+            #expect(destination.surfaceResumeBinding(panelId: panelID) == original)
+            if phase == "queued" {
+                #expect(terminal.surface.onStartupRestoreAbandoned?(UUID()) == false)
+                terminal.surface.cancelStartupRestoreAdmission()
+            }
+            let manual = try #require(destination.surfaceResumeBinding(panelId: panelID))
+            #expect(manual.command == original.command)
+            #expect(manual.launchCommand == original.launchCommand)
+            #expect(manual.autoResume == false)
+            #expect(manual.approvalPolicy == .manual)
+            #expect(manual.approvalRecordId == nil)
+        }
+    }
+
+    @Test(arguments: ["workspace", "workspaceDock", "globalDock"], ["tmux", "ssh"])
+    func workspaceDoesNotAdoptUnownedAutomaticProcessBindings(origin: String, kind: String) throws {
+        for hasForeignGeneration in [false, true] {
+            let source = Workspace()
+            defer { source.teardownAllPanels() }
+            let destination = Workspace()
+            defer { destination.teardownAllPanels() }
+            let terminal = try stagedTerminal(in: source, kind: kind)
+            var unowned = binding(kind: kind)
+            if hasForeignGeneration {
+                unowned.armRestoredProcessDetectionObservation(terminalLifecycleID: UUID())
+            }
+            source.surfaceResumeBindingsByPanelId[terminal.id] = unowned
+            var transfer = try #require(source.detachSurface(panelId: terminal.id))
+            var dock: DockSplitStore?
+            defer { dock?.closeAllPanels() }
+            if origin != "workspace" {
+                let owner = DockSplitStore(
+                    workspaceId: UUID(),
+                    scope: origin == "globalDock" ? .global : .workspace,
+                    baseDirectoryProvider: { "/tmp" }
+                )
+                dock = owner
+                let pane = try #require(owner.bonsplitController.allPaneIds.first)
+                let dockPanelID = try #require(owner.attachDetachedSurface(transfer, inPane: pane, focus: false))
+                transfer = try #require(owner.detachSurface(panelId: dockPanelID))
+            }
+            let pane = try #require(destination.bonsplitController.allPaneIds.first)
+            let panelID = try #require(destination.attachDetachedSurface(transfer, inPane: pane, focus: false))
+
+            #expect(destination.surfaceResumeBinding(panelId: panelID) == nil)
+            #expect(terminal.surface.onStartupRestoreAbandoned?(terminal.surface.terminalLifecycleId) == false)
+        }
+    }
+
+    @Test(arguments: [DockScope.workspace, .global], ["missing", "unavailable"])
+    func recoveryFreezeDowngradesEvenAnOwnedQueuedDockRestore(scope: DockScope, detection: String) throws {
+        let source = Workspace()
+        defer { source.teardownAllPanels() }
+        let terminal = try stagedTerminal(in: source)
+        let original = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+        let transfer = try #require(source.detachSurface(panelId: terminal.id))
+        let dock = DockSplitStore(workspaceId: UUID(), scope: scope, baseDirectoryProvider: { "/tmp" })
+        defer { dock.closeAllPanels() }
+        let pane = try #require(dock.bonsplitController.allPaneIds.first)
+        let panelID = try #require(dock.attachDetachedSurface(transfer, inPane: pane, focus: false))
+        let index: SurfaceResumeBindingIndex? = detection == "unavailable" ? .unavailable : nil
+
+        for forceManualRecovery in [false, true] {
+            dock.surfaceResumeBindingsByPanelId[panelID] = original
+            let snapshot = dock.sessionSnapshot(
+                includeScrollback: false,
+                surfaceResumeBindingIndex: index,
+                downgradeStoredProcessDetectedResumeBindingsWhenDetectionUnavailable: forceManualRecovery,
+                currentAgentProcessIdentity: { _ in nil },
+                agentProcessPresence: { _ in .absent }
+            )
+            let saved = try #require(snapshot.panels.first(where: { $0.id == panelID })?.terminal?.resumeBinding)
+            #expect(saved.command == original.command)
+            #expect(saved.launchCommand == original.launchCommand)
+            #expect(saved.autoResume == !forceManualRecovery)
+            if forceManualRecovery {
+                #expect(saved.approvalPolicy == .manual)
+                #expect(saved.approvalRecordId == nil)
+                #expect(dock.surfaceResumeBindingsByPanelId[panelID] == saved)
+                let later = dock.sessionSnapshot(includeScrollback: false, surfaceResumeBindingIndex: .empty)
+                #expect(later.panels.first(where: { $0.id == panelID })?.terminal?.resumeBinding == saved)
+            }
+        }
+    }
+
+    @Test(arguments: [DockScope.workspace, .global])
+    func recoveryFreezeStillUsesAnActuallyDetectedDockProcess(scope: DockScope) throws {
+        let source = Workspace()
+        defer { source.teardownAllPanels() }
+        let terminal = try stagedTerminal(in: source)
+        let original = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+        let transfer = try #require(source.detachSurface(panelId: terminal.id))
+        let dock = DockSplitStore(workspaceId: UUID(), scope: scope, baseDirectoryProvider: { "/tmp" })
+        defer { dock.closeAllPanels() }
+        let pane = try #require(dock.bonsplitController.allPaneIds.first)
+        let panelID = try #require(dock.attachDetachedSurface(transfer, inPane: pane, focus: false))
+        let detected = SurfaceResumeBindingIndex(bindingsByPanel: [
+            .init(workspaceId: dock.workspaceId, panelId: panelID): original
+        ])
+
+        let snapshot = dock.sessionSnapshot(
+            includeScrollback: false,
+            surfaceResumeBindingIndex: detected,
+            downgradeStoredProcessDetectedResumeBindingsWhenDetectionUnavailable: true,
+            currentAgentProcessIdentity: { _ in nil },
+            agentProcessPresence: { _ in .absent }
+        )
+        let saved = try #require(snapshot.panels.first(where: { $0.id == panelID })?.terminal?.resumeBinding)
+        #expect(saved == original)
+        #expect(saved.autoResume == true)
+        #expect(dock.surfaceResumeBindingsByPanelId[panelID]?.restoredProcessDetectionObservation == nil)
+    }
+
     @Test func workspaceRejectsAnOldEventAfterTheSameSurfaceAdvancesGeneration() throws {
         let workspace = Workspace()
         defer { workspace.teardownAllPanels() }
@@ -1021,7 +1181,7 @@ struct ProcessDetectedStartupOwnershipTests {
         #expect(dock.surfaceResumeBindingsByPanelId[panelID]?.autoResume == false)
     }
 
-    private func stagedTerminal(in workspace: Workspace) throws -> TerminalPanel {
+    private func stagedTerminal(in workspace: Workspace, kind: String = "tmux") throws -> TerminalPanel {
         let pane = try #require(workspace.bonsplitController.allPaneIds.first)
         let terminal = try #require(workspace.newTerminalSurface(
             inPane: pane,
@@ -1029,7 +1189,7 @@ struct ProcessDetectedStartupOwnershipTests {
             initialInput: "cmux restore --surface\n",
             runtimeSpawnPolicy: .pacedSessionRestore.requiringStartupRestoreAdmission()
         ))
-        var pending = binding()
+        var pending = binding(kind: kind)
         pending.armRestoredProcessDetectionObservation(terminalLifecycleID: terminal.surface.terminalLifecycleId)
         workspace.surfaceResumeBindingsByPanelId[terminal.id] = pending
         return terminal
