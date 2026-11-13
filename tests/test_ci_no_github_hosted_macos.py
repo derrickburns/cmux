@@ -102,16 +102,23 @@ def python_fork_literals(source: str) -> set[tuple[int, int, int]]:
         for name in ("REPO", "repository")
     }
     definitions = [node for node in ast.walk(tree)
-                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
     rebound = {node.id for node in ast.walk(tree)
                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))}
     rebound.update(node.arg for node in ast.walk(tree) if isinstance(node, ast.arg))
     rebound.update(alias.asname or alias.name.split(".")[0]
                    for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
                    for alias in node.names)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            rebound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            rebound.add(node.rest)
+    wildcard_import = any(isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+                          for node in ast.walk(tree))
     helpers = set()
     for node in tree.body:
-        if not isinstance(node, ast.FunctionDef) or node.decorator_list or node.name in rebound:
+        if wildcard_import or not isinstance(node, ast.FunctionDef) or node.decorator_list or node.name in rebound:
             continue
         if sum(other.name == node.name for other in definitions) != 1:
             continue
