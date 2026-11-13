@@ -1,4 +1,5 @@
 import CmuxSettings
+import CmuxWorkspaces
 import Foundation
 
 private func sanitizedInitialEnvironment(_ environment: [String: String]) -> [String: String] {
@@ -20,6 +21,7 @@ extension TerminalController {
         let titleSource: Workspace.CustomTitleSource
         let description: String?
         let initialCommand: String?
+        let initialTmuxStartCommand: String?
         let initialTerminalIsRemote: Bool
         let initialInput: String?
         let initialEnvironment: [String: String]
@@ -45,6 +47,27 @@ extension TerminalController {
         workingDirectory: String?
     ) -> WorkspaceCreateExecutionPreparationOutcome {
         let requestedInitialCommand = v2RawString(params, "initial_command")
+        let initialTmuxStartCommand: String?
+        if v2HasNonNullParam(params, "tmux_start_command") {
+            guard let requested = v2RawString(params, "tmux_start_command"),
+                  requested == requestedInitialCommand,
+                  LocalSessionRestoreCommandPolicy.restorableCommand(requested) == requested,
+                  !v2HasNonNullParam(params, "initial_input"),
+                  !v2HasNonNullParam(params, "layout"),
+                  !v2HasNonNullParam(params, "initial_terminal_is_remote") else {
+                return .failure(.err(
+                    code: "invalid_params",
+                    message: String(
+                        localized: "socket.workspace.error.invalidLocalSessionCommand",
+                        defaultValue: "tmux_start_command must match a supported initial_command without initial_input, layout, or initial_terminal_is_remote"
+                    ),
+                    data: nil
+                ))
+            }
+            initialTmuxStartCommand = requested
+        } else {
+            initialTmuxStartCommand = nil
+        }
         let initialCommand = requestedInitialCommand.flatMap {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? nil
@@ -175,6 +198,7 @@ extension TerminalController {
             titleSource: titleSource,
             description: description,
             initialCommand: initialCommand,
+            initialTmuxStartCommand: initialTmuxStartCommand,
             initialTerminalIsRemote: initialTerminalIsRemote,
             initialInput: initialInput,
             initialEnvironment: initialEnvironment,

@@ -25,6 +25,7 @@ extension WorkspaceCreateWorkingDirectoryTests {
 
         _ = TerminalController.shared.v2WorkspaceCreate(params: [
             "initial_command": command,
+            "tmux_start_command": command,
             "focus": false,
         ], tabManager: manager)
 
@@ -32,7 +33,7 @@ extension WorkspaceCreateWorkingDirectoryTests {
         let panels = created.panels.values.compactMap { $0 as? TerminalPanel }
         let panel = try #require(panels.first)
         #expect(panels.count == 1)
-        #expect(panel.surface.debugInitialCommand() == command)
+        #expect(panel.surface.debugInitialCommand() == WorkspaceInitialCommandLoginShell.wrap(command))
         #expect(panel.surface.debugTmuxStartCommand() == command)
         #expect(panel.surface.debugInitialInputForTesting() == nil)
         let snapshot = created.sessionSnapshot(includeScrollback: false)
@@ -56,6 +57,29 @@ extension WorkspaceCreateWorkingDirectoryTests {
         #expect(panel.surface.debugTmuxStartCommand() == nil)
         let saved = try #require(created.sessionSnapshot(includeScrollback: false).panels.first { $0.id == panel.id })
         #expect(saved.terminal?.tmuxStartCommand == nil)
+    }
+
+    @Test func initialLocalSessionWithoutRestoreIntentKeepsOrdinaryCommandBehavior() throws {
+        let manager = TabManager(autoWelcomeIfNeeded: false)
+        let originalWorkspaceIDs = Set(manager.tabs.map(\.id))
+        let command = LocalTmuxCommandBuilder(
+            tmuxPath: "/synthetic/tmux",
+            socketPath: "/private/tmp/synthetic-case-view/server.sock"
+        ).attachCommand(binding: LocalTmuxSessionBinding(
+            sessionID: try #require(LocalTmuxSessionIdentity("$31")),
+            serverID: UUID(uuidString: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")!,
+            sessionCreated: 31
+        ))
+
+        _ = TerminalController.shared.v2WorkspaceCreate(params: [
+            "initial_command": command,
+            "focus": false,
+        ], tabManager: manager)
+
+        let created = try #require(manager.tabs.first { !originalWorkspaceIDs.contains($0.id) })
+        let panel = try #require(created.panels.values.compactMap { $0 as? TerminalPanel }.first)
+        #expect(panel.surface.debugInitialCommand() == WorkspaceInitialCommandLoginShell.wrap(command))
+        #expect(panel.surface.debugTmuxStartCommand() == nil)
     }
 
     @MainActor

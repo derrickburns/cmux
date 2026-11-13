@@ -1774,3 +1774,8 @@ lane = "linux-guard"
 [[test]]
 path = "tests/test_ci_frame_pacing_dispatch.py"
 lane = "linux-guard"
+
+[[test]]
+path = "tests/test_cli_local_tmux_initial_workspace.py"
+lane = "macos-cli-no-socket"
+requirements = ["cmux-cli"]

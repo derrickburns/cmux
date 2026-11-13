@@ -17,7 +17,11 @@ import uuid
 
 class LocalTmuxInitialWorkspaceTest(unittest.TestCase):
     def setUp(self):
-        self.cli = os.environ.get("CMUX_CLI_PATH")
+        explicit = os.environ.get("CMUX_CLI_PATH")
+        lane_cli = os.environ.get("CMUX_CLI_BIN")
+        if explicit and lane_cli and Path(explicit).resolve() != Path(lane_cli).resolve():
+            raise RuntimeError("CMUX_CLI_PATH and the maintained lane's CMUX_CLI_BIN disagree")
+        self.cli = explicit or lane_cli
         if not self.cli or not Path(self.cli).is_file():
             raise RuntimeError("Set CMUX_CLI_PATH to the source-bound built CLI")
         self.temp = tempfile.TemporaryDirectory(prefix="cmux-local-initial-", dir="/private/tmp")
@@ -136,10 +140,12 @@ class LocalTmuxInitialWorkspaceTest(unittest.TestCase):
         self.assertIsInstance(command, str, "the initial terminal must own the attach command at creation")
         self.assertIn("@cmux_local_server_id", command)
         self.assertIn(self.server_id, command)
+        self.assertEqual(created[0]["params"].get("tmux_start_command"), command)
         reply = json.loads(result.stdout)
-        self.assertEqual(reply["workspace_id"], self.workspace)
-        self.assertEqual(reply["surface_id"], self.surface)
-        self.assertEqual(reply["session_id"], self.logical)
+        self.assertEqual(uuid.UUID(reply["workspace_id"]), uuid.UUID(self.workspace))
+        self.assertEqual(uuid.UUID(reply["surface_id"]), uuid.UUID(self.surface))
+        self.assertEqual(uuid.UUID(reply["session_id"]), uuid.UUID(self.logical))
+        self.assertEqual(reply["tmux_start_command"], command)
 
     def test_lost_initial_create_reply_is_not_reissued_or_followed_by_respawn(self):
         self.drop_create_reply = True
@@ -160,6 +166,29 @@ class LocalTmuxInitialWorkspaceTest(unittest.TestCase):
         self.assertEqual(self.methods().count("surface.create"), 1)
         self.assertNotIn("workspace.create", self.methods())
         self.assertNotIn("surface.respawn", self.methods())
+
+    def test_new_workspace_selection_ignores_existing_surfaces_and_returns_the_owner_command(self):
+        self.existing_workspace = True
+        result = self.attach("--new-workspace")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.failures, [])
+        self.assertEqual(self.methods().count("workspace.create"), 1)
+        self.assertNotIn("workspace.current", self.methods())
+        self.assertNotIn("surface.list", self.methods())
+        self.assertNotIn("surface.create", self.methods())
+        self.assertNotIn("surface.respawn", self.methods())
+        request = next(item for item in self.requests if item["method"] == "workspace.create")
+        self.assertEqual(request["params"]["initial_command"], request["params"]["tmux_start_command"])
+        self.assertEqual(json.loads(result.stdout)["tmux_start_command"], request["params"]["tmux_start_command"])
+
+    def test_new_workspace_rejects_conflicting_targets_before_dispatch(self):
+        for options in (("--workspace", self.workspace), ("--surface", self.surface),
+                        ("--headless",), ("--detached",), ("--new-client",)):
+            with self.subTest(options=options):
+                result = self.attach("--new-workspace", *options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--new-workspace", result.stderr)
+                self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":

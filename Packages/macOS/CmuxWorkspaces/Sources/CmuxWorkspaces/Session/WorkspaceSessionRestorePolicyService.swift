@@ -1,5 +1,14 @@
 public import Foundation
 
+/// Recognizes the closed attach commands emitted by the local session owners.
+/// The result is metadata and never executes or discovers a session.
+public enum LocalSessionRestoreCommandPolicy {
+    public static func restorableCommand(_ rawCommand: String?) -> String? {
+        LocalTmuxRestoreCommandPolicy().restorableCommand(rawCommand)
+            ?? LocalZellijRestoreCommandPolicy().restorableCommand(rawCommand)
+    }
+}
+
 /// Service that owns workspace session restore policy decisions.
 ///
 /// The app target injects concrete approval storage, prompt handling, automated
@@ -182,8 +191,7 @@ public struct WorkspaceSessionRestorePolicyService<Binding: WorkspaceSurfaceResu
     /// - Parameter rawCommand: The persisted terminal startup command.
     /// - Returns: The validated attach command, or `nil` for ordinary commands.
     public func localTmuxStartCommand(_ rawCommand: String?) -> String? {
-        LocalTmuxRestoreCommandPolicy().restorableCommand(rawCommand)
-            ?? LocalZellijRestoreCommandPolicy().restorableCommand(rawCommand)
+        LocalSessionRestoreCommandPolicy.restorableCommand(rawCommand)
     }
 
     /// Returns whether terminal scrollback should be persisted when closing/restoring.

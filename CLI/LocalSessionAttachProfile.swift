@@ -8,9 +8,10 @@ struct LocalSessionAttachRequest {
     var window: String?
     var focus: Bool?
     var newClient = false
+    var newWorkspace = false
 
     var hasTarget: Bool {
-        workspace != nil || surface != nil || pane != nil || window != nil || focus != nil
+        workspace != nil || surface != nil || pane != nil || window != nil || focus != nil || newWorkspace
     }
 }
 

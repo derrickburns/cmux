@@ -20,7 +20,8 @@ extension CMUXCLI {
                 pane: invocation.pane,
                 window: invocation.window,
                 focus: invocation.focus,
-                newClient: invocation.newClient
+                newClient: invocation.newClient,
+                newWorkspace: invocation.newWorkspace
             ),
             profile: .localTmux,
             registry: registry,
@@ -49,7 +50,7 @@ extension CMUXCLI {
             profile: profile,
             client: client
         )
-        guard workspace.id != nil || (originalRecord.workspaceID == nil && originalRecord.workspaceTitle == nil) else {
+        guard request.newWorkspace || workspace.id != nil || (originalRecord.workspaceID == nil && originalRecord.workspaceTitle == nil) else {
             throw CLIError(message: profile.workspaceNotFound())
         }
         let existingSurface: String? = if !request.newClient,
@@ -140,6 +141,8 @@ extension CMUXCLI {
                 "title": workspace.title ?? "\(profile.workspaceTitlePrefix)\(originalRecord.name)",
                 "cwd": originalRecord.cwd,
                 "focus": request.focus ?? true,
+                "initial_command": attachCommand,
+                "tmux_start_command": attachCommand,
             ]
             if let windowRaw = request.window,
                let windowID = try normalizeWindowHandle(windowRaw, client: client) {
@@ -150,16 +153,11 @@ extension CMUXCLI {
                   let surfaceID = created["surface_id"] as? String else {
                 throw CLIError(message: profile.workspaceCreateFailed(originalRecord.name))
             }
-            payload = try client.sendV2(method: "surface.respawn", params: [
-                "workspace_id": workspaceID,
-                "surface_id": surfaceID,
-                "command": attachCommand,
-                "initial_command": attachCommand,
-                "tmux_start_command": attachCommand,
-                "working_directory": originalRecord.cwd,
-                "focus": request.focus ?? true,
-            ])
+            // Spawn the attach command with the initial terminal. Replacing
+            // that terminal after publication could discard intervening input.
+            payload = created
             payload["workspace_id"] = workspaceID
+            payload["surface_id"] = surfaceID
         }
 
         let workspaceID = (payload["workspace_id"] as? String) ?? workspace.id
@@ -185,6 +183,7 @@ extension CMUXCLI {
         payload["tmux_session_id"] = originalRecord.tmuxBinding?.sessionID.rawValue ?? NSNull()
         payload["surface_id"] = updated.surfaceID ?? NSNull()
         payload["socket_path"] = socketPath
+        payload["tmux_start_command"] = attachCommand
         payload["mode"] = profile.mode
         let fallback = profile.attached(updated.name, surfaceID)
         printV2Payload(payload, jsonOutput: jsonOutput, idFormat: idFormat, fallbackText: fallback)
@@ -197,6 +196,9 @@ extension CMUXCLI {
         client: SocketClient
     ) throws -> (id: String?, title: String?, cwd: String?) {
         let windowID = try normalizeWindowHandle(request.window, client: client)
+        if request.newWorkspace {
+            return (nil, record.workspaceTitle, record.cwd)
+        }
         if let rawWorkspace = request.workspace {
             let summary = try workspaceSummary(workspaceSelector: rawWorkspace, windowID: windowID, client: client, fallbackTitle: record.workspaceTitle, fallbackCwd: record.cwd)
             guard summary.id != nil else {

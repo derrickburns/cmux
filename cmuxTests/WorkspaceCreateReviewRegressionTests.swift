@@ -11,6 +11,50 @@ import Testing
 
 @MainActor
 @Suite(.serialized) struct WorkspaceCreateReviewRegressionTests {
+    private static let localZellijFixtureCommand =
+        "/usr/bin/env ZELLIJ_SOCKET_DIR='/private/tmp/synthetic-view/sock' CMUX_LOCAL_ZELLIJ=1 "
+        + "'/synthetic/zellij' 'attach' 'view-eeeeeeee' 'options' '--on-force-close' 'detach'"
+
+    @Test func initialZellijAttachmentIsEnrolledByTheSharedCreationOwner() throws {
+        let manager = TabManager(autoWelcomeIfNeeded: false)
+        let before = Set(manager.tabs.map(\.id))
+        let command = Self.localZellijFixtureCommand
+
+        _ = TerminalController.shared.v2WorkspaceCreate(params: [
+            "initial_command": command,
+            "tmux_start_command": command,
+            "focus": false,
+        ], tabManager: manager)
+
+        let created = try #require(manager.tabs.first { !before.contains($0.id) })
+        let panels = created.panels.values.compactMap { $0 as? TerminalPanel }
+        let panel = try #require(panels.first)
+        #expect(panels.count == 1)
+        #expect(panel.surface.debugInitialCommand() == WorkspaceInitialCommandLoginShell.wrap(command))
+        #expect(panel.surface.debugTmuxStartCommand() == command)
+        #expect(panel.surface.debugInitialInputForTesting() == nil)
+        let saved = try #require(created.sessionSnapshot(includeScrollback: false).panels.first { $0.id == panel.id })
+        #expect(saved.terminal?.tmuxStartCommand == command)
+    }
+
+    @Test func initialLocalSessionMetadataRejectsContradictionsBeforeCreatingAnything() {
+        let command = "/usr/bin/env CMUX_LOCAL_TMUX=1 /synthetic/tmux attach -t unowned"
+        let canonical = Self.localZellijFixtureCommand
+        let requests: [[String: Any]] = [
+            ["initial_command": canonical, "tmux_start_command": command],
+            ["initial_command": "true", "tmux_start_command": canonical],
+            ["initial_command": canonical, "tmux_start_command": canonical, "initial_input": "synthetic input"],
+            ["initial_command": canonical, "tmux_start_command": canonical, "layout": [:]],
+            ["initial_command": canonical, "tmux_start_command": canonical, "initial_terminal_is_remote": true],
+        ]
+        for params in requests {
+            let manager = TabManager(autoWelcomeIfNeeded: false)
+            let before = Set(manager.tabs.map(\.id))
+            _ = TerminalController.shared.v2WorkspaceCreate(params: params, tabManager: manager)
+            #expect(Set(manager.tabs.map(\.id)) == before)
+        }
+    }
+
     @Test("worktree creation result preserves filesystem identity")
     func worktreeCreationResultPreservesFilesystemIdentity() {
         let result = CmuxExtensionWorktreeCreationResult(
@@ -281,6 +325,7 @@ private final class RejectingWorkspaceCreationTabManager: TabManager {
         workingDirectory overrideWorkingDirectory: String?,
         initialSurface: NewWorkspaceInitialSurface,
         initialTerminalCommand: String?,
+        initialTerminalTmuxStartCommand: String?,
         initialTerminalIsRemote: Bool,
         initialTerminalInput: String?,
         initialTerminalStartupRestoreAgent: SessionRestorableAgentSnapshot?,
@@ -308,6 +353,7 @@ private final class RejectingWorkspaceCreationTabManager: TabManager {
                 workingDirectory: overrideWorkingDirectory,
                 initialSurface: initialSurface,
                 initialTerminalCommand: initialTerminalCommand,
+                initialTerminalTmuxStartCommand: initialTerminalTmuxStartCommand,
                 initialTerminalIsRemote: initialTerminalIsRemote,
                 initialTerminalInput: initialTerminalInput,
                 initialTerminalStartupRestoreAgent: initialTerminalStartupRestoreAgent,

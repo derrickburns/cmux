@@ -4237,6 +4237,7 @@ final class Workspace: Identifiable, ObservableObject, FilePreviewTabMetadataHos
         configTemplate: CmuxSurfaceConfigTemplate? = nil,
         initialSurface: NewWorkspaceInitialSurface = .terminal,
         initialTerminalCommand: String? = nil,
+        initialTerminalTmuxStartCommand: String? = nil,
         initialTerminalIsRemote: Bool = false,
         initialTerminalInput: String? = nil,
         initialTerminalStartupRestoreAgent: SessionRestorableAgentSnapshot? = nil,
@@ -4447,6 +4448,7 @@ final class Workspace: Identifiable, ObservableObject, FilePreviewTabMetadataHos
                 workingDirectory: hasWorkingDirectory ? trimmedWorkingDirectory : nil,
                 portOrdinal: portOrdinal,
                 initialCommand: initialTerminalCommand,
+                tmuxStartCommand: sessionRestorePolicy.localTmuxStartCommand(initialTerminalTmuxStartCommand),
                 initialInput: initialTerminalInput,
                 initialEnvironmentOverrides: Self.startupEnvironment(
                     workspaceEnvironment: sanitizedWorkspaceEnvironment,
