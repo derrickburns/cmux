@@ -323,6 +323,24 @@ class NoGitHubHostedMacos(unittest.TestCase):
                     '    if repository.split("/", 1)[0].casefold() != "manaflow-ai":\n'
                     f'        return {value}\n'))
 
+    def test_python_helper_cannot_be_rebound_by_other_syntax(self):
+        prefix = ('REPO = "manaflow-ai/cmux"\n'
+                  'def hosted_fork():\n'
+                  '    return REPO.split("/", 1)[0].casefold() != "manaflow-ai"\n')
+        tail = ('def pick():\n'
+                '    if hosted_fork():\n'
+                '        return "macos-26"\n')
+        for binding in (
+            'class hosted_fork: pass\n',
+            'try: check()\nexcept Exception as hosted_fork: pass\n',
+            'match supplied:\n    case {"helper": hosted_fork}: pass\n',
+            'match supplied:\n    case [*hosted_fork]: pass\n',
+            'match supplied:\n    case {**hosted_fork}: pass\n',
+            'from another_route import *\n',
+        ):
+            with self.subTest(binding=binding):
+                self.assertTrue(self.scan_python(prefix + binding + tail))
+
     def test_no_workflow_selects_a_github_hosted_mac(self):
         left = unexempted(workflow_hits(ROOT))
         self.assertEqual(left, [], "A workflow selects a GitHub-hosted Mac outside the fork branch. Route it "
