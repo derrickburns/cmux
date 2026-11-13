@@ -342,7 +342,7 @@ class ProductRunnerTests(unittest.TestCase):
 
     def test_github_hosted_admission_maps_to_the_same_macos(self) -> None:
         api = self.api_for([{"name": "macos / macOS compile admission", "labels": ["macos-26"]}])
-        self.assertEqual(rerun.product_runner("o/r", "5", api), "blacksmith-6vcpu-macos-26")
+        self.assertEqual(rerun.product_runner("manaflow-ai/cmux", "5", api), "blacksmith-6vcpu-macos-26")
 
     def test_owned_pool_admission_maps_to_the_lane_xcode_pool(self) -> None:
         # An owned Mac carries the pull-request lane's Xcode, the macOS 26 pools' pin.
