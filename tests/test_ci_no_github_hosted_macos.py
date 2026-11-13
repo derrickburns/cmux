@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -138,6 +140,85 @@ class NoGitHubHostedMacos(unittest.TestCase):
                 self.assertFalse(HOSTED_MACOS.search(FORK_BRANCH.sub("", strip_comment(line))))
         # A matrix row is read like any other line: `runs-on: ${{ matrix.hosted_runner }}` would reach it.
         self.assertTrue(HOSTED_MACOS.search(FORK_BRANCH.sub("", strip_comment("          hosted_runner: macos-15"))))
+
+    def scan_python(self, source: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "scripts" / "any_route.py"
+            script.parent.mkdir()
+            script.write_text(textwrap.dedent(source), encoding="utf-8")
+            return script_hits(root)
+
+    def test_python_personal_owner_branches_are_supported(self):
+        for source in (
+            """
+            def pick(repository):
+                if repository.split("/", 1)[0].casefold() != "manaflow-ai":
+                    return "macos-26"
+                return "blacksmith-6vcpu-macos-26"
+            """,
+            """
+            def pick(repository, label):
+                if label == "macos-26" and repository.split("/", 1)[0].casefold() != "manaflow-ai":
+                    return "macos-26"
+                return None
+            """,
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.scan_python(source), [])
+
+    def test_python_pure_personal_owner_helper_is_supported(self):
+        self.assertEqual(self.scan_python('''
+            REPO = "manaflow-ai/cmux"
+            def hosted_fork():
+                """The same owner branch as the workflow."""
+                return REPO.split("/", 1)[0].casefold() != "manaflow-ai"
+            def pick():
+                if hosted_fork():
+                    return "macos-26"
+                return "blacksmith-6vcpu-macos-26"
+            def product(labels):
+                if hosted_fork():
+                    return "macos-26" if "macos-26" in labels else None
+                return None
+            def reuse(found):
+                if hosted_fork() and found.get("runner") != "macos-26":
+                    return None
+                return found
+        '''), [])
+
+    def test_python_upstream_and_unproven_routes_stay_rejected(self):
+        pure = '''
+            REPO = "manaflow-ai/cmux"
+            def hosted_fork():
+                return REPO.split("/", 1)[0].casefold() != "manaflow-ai"
+        '''
+        cases = [
+            'def pick():\n    return "macos-26"\n',
+            'def pick(repository):\n    if repository.split("/", 1)[0].casefold() == "manaflow-ai":\n        return "macos-26"\n',
+            'def pick(repository, ready):\n    if repository.split("/", 1)[0].casefold() != "manaflow-ai" or ready:\n        return "macos-26"\n',
+            'def pick(repository):\n    if repository.split("/", 1)[0].casefold() != "manaflow-ai":\n        return None\n    else:\n        return "macos-26"\n',
+            'def hosted_fork():\n    return True\ndef pick():\n    if hosted_fork():\n        return "macos-26"\n',
+            textwrap.dedent(pure) + 'hosted_fork = lambda: True\ndef pick():\n    if hosted_fork():\n        return "macos-26"\n',
+            textwrap.dedent(pure) + 'def pick(hosted_fork):\n    if hosted_fork():\n        return "macos-26"\n',
+            '@replace\ndef hosted_fork():\n    return REPO.split("/", 1)[0].casefold() != "manaflow-ai"\ndef pick():\n    if hosted_fork():\n        return "macos-26"\n',
+            'def pick(repository):\n    if repository.split("/", 1)[0].casefold() != "manaflow-ai":\n        def escaped():\n            return "macos-26"\n        return escaped\n',
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertTrue(self.scan_python(source))
+
+    def test_python_admission_is_per_literal_not_per_source_line(self):
+        # The first call executes before the owner comparison, including upstream.
+        # Its literal must not inherit the neighboring comparison/return's custody.
+        hits = self.scan_python('''
+            def pick(repository, label):
+                if emit("macos-26") and repository.split("/", 1)[0].casefold() != "manaflow-ai" and label == "macos-26":
+                    return "macos-26"
+                return None
+        ''')
+        self.assertEqual(len(hits), 1, hits)
+        self.assertIn('emit("macos-26")', hits[0])
 
     def test_no_workflow_selects_a_github_hosted_mac(self):
         left = unexempted(workflow_hits(ROOT))
