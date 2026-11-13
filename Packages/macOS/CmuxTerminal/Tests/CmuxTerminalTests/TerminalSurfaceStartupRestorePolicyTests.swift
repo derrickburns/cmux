@@ -8,6 +8,33 @@ import Testing
 @MainActor
 @Suite
 struct TerminalSurfaceStartupRestorePolicyTests {
+    @Test("Public cancellation prevents staged restore input at a later prompt")
+    func publicCancellationConsumesStagedCommandBeforeLaterPrompt() {
+        let nativeView = FakeTerminalSurfaceNativeView(
+            frame: NSRect(x: 0, y: 0, width: 800, height: 600)
+        )
+        let paneHost = FakeTerminalSurfacePaneHost(
+            surfaceView: nativeView,
+            attachesThroughSurfaceModel: true
+        )
+        let surface = makeSurface(
+            policy: .pacedSessionRestore.requiringStartupRestoreAdmission(),
+            scheduler: RecordingRestoreSpawnScheduler(),
+            nativeView: nativeView,
+            paneHost: paneHost
+        )
+        defer { surface.closeHeadlessStartupWindowIfNeeded() }
+        let generation = surface.terminalLifecycleId
+        surface.startupInputGate.stage("original restore\n", generation: generation)
+
+        surface.cancelStartupRestoreAdmission()
+
+        let inputAtLaterPrompt = surface.startupInputGate.takeForPrompt(generation: generation)
+        #expect(inputAtLaterPrompt == nil)
+        #expect(!surface.admitStartupRestoreRuntime(initialInput: "late restore\n"))
+        #expect(surface.suppressConfiguredInitialInput)
+    }
+
     @Test("Restore admission composes with relaunch spawn pacing")
     func admissionPreservesRestorePacing() {
         let nativeView = FakeTerminalSurfaceNativeView(
