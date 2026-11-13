@@ -24,6 +24,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, Iterable
+from urllib.parse import urlsplit
 
 TEST_ROOT = "cmuxTests/"
 PRODUCTS_PREFIX = "app-host-products-v1-"
@@ -34,6 +35,59 @@ TEST_TARGET = "cmuxTests"
 # a rerun keeps CI's app as it is.
 OUTSIDE_THE_APP = (TEST_ROOT, "cmuxUITests/", ".github/", "docs/", "scripts/ci/", "tests/", "web/")
 SELECTOR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*(\(\))?)?)?$")
+
+
+def repository_name(value: str) -> str:
+    """A repository identifier, never a URL, path or ambient gh selection."""
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}", value
+    ):
+        raise ValueError("repository must be OWNER/NAME")
+    owner, name = value.split("/")
+    if "--" in owner or name in (".", "..") or name.endswith(".git"):
+        raise ValueError("repository must be OWNER/NAME")
+    return value
+
+
+def belongs_to_repository(value: dict, repository: str, *, resource: str = "actions/") -> bool:
+    """Reject contradictory owners in receipts returned by a scoped API call.
+
+    Some API projections omit the owner/URL. Their query remains scoped to the
+    explicit repository; a supplied owner must agree with that query.
+    """
+    if not isinstance(value, dict):
+        return False
+    owner = value.get("repository")
+    if isinstance(owner, dict) and owner.get("full_name") is not None:
+        if not isinstance(owner["full_name"], str) or owner["full_name"].casefold() != repository.casefold():
+            return False
+    prefixes = {
+        "github.com": f"/{repository}/{resource}",
+        "api.github.com": f"/repos/{repository}/{resource}",
+    }
+    for field in ("url", "html_url", "archive_download_url"):
+        raw = value.get(field)
+        if raw in (None, ""):
+            continue
+        if not isinstance(raw, str):
+            return False
+        try:
+            url = urlsplit(raw)
+        except ValueError:
+            return False
+        prefix = prefixes.get(url.netloc.casefold())
+        if (url.scheme != "https" or prefix is None or url.query or url.fragment
+                or not url.path.casefold().startswith(prefix.casefold())):
+            return False
+        if resource == "actions/runs/":
+            suffix = url.path[len(prefix):]
+            identifier = value.get("databaseId", value.get("id"))
+            if not suffix.isdecimal() or (identifier is not None and (
+                not isinstance(identifier, int) or isinstance(identifier, bool)
+                or identifier <= 0 or int(suffix) != identifier
+            )):
+                return False
+    return True
 
 
 def git(*args: str, cwd: str | None = None) -> str:
@@ -76,7 +130,8 @@ def products_artifact(repository: str, run_id: str, api: Callable[[str], dict]) 
         artifacts = api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100{more}").get(
             "artifacts", [])
         for artifact in artifacts:
-            if artifact.get("name", "").startswith(PRODUCTS_PREFIX) and not artifact.get("expired"):
+            if (artifact.get("name", "").startswith(PRODUCTS_PREFIX) and not artifact.get("expired")
+                    and belongs_to_repository(artifact, repository)):
                 return artifact
         if len(artifacts) < 100:
             break
@@ -95,15 +150,16 @@ def commit_parents(revision: str, cwd: str | None = None) -> list[str]:
     return [line.split(" ", 1)[1] for line in header.splitlines() if line.startswith("parent ")]
 
 
-def fetch_commit(revision: str, cwd: str | None = None) -> None:
+def fetch_commit(revision: str, cwd: str | None = None, *, repository: str | None = None) -> None:
     """Fetch a commit outside the checkout's history, such as a pull request merge.
 
     GitHub serves any commit in the fork network by SHA, so this also reaches
     a merge that `refs/pull/N/merge` has since moved past.
     """
+    remote = "origin" if repository is None else f"https://github.com/{repository_name(repository)}.git"
     present = subprocess.run(["git", "cat-file", "-e", f"{revision}^{{commit}}"], cwd=cwd, capture_output=True)
     if present.returncode != 0:
-        git("fetch", "--no-tags", "--quiet", "origin", revision, cwd=cwd)
+        git("fetch", "--no-tags", "--quiet", remote, revision, cwd=cwd)
 
 
 def built_revision(run: dict, cwd: str | None = None, fetch: Callable[[str], None] | None = None) -> str:
@@ -164,6 +220,8 @@ def find_products(
     for revision in revisions:
         runs = api(f"repos/{repository}/actions/runs?head_sha={revision}&status=completed&per_page=50")
         for run in sorted(runs.get("workflow_runs", []), key=lambda item: item.get("created_at", ""), reverse=True):
+            if not belongs_to_repository(run, repository, resource="actions/runs/"):
+                continue
             artifact = products_artifact(repository, str(run["id"]), api)
             if not artifact:
                 continue
@@ -196,6 +254,8 @@ def product_runner(repository: str, run_id: str, api: Callable[[str], dict], pag
             # test-e2e.yml compiles in its `build` job.
             if job.get("name", "").endswith(ADMISSION_JOB) or job.get("name") == "build":
                 for label in job.get("labels", []):
+                    if label == "macos-26" and repository.split("/", 1)[0].casefold() != "manaflow-ai":
+                        return "macos-26"
                     # An owned Mac pool carries the pull-request lane's Xcode,
                     # which is the macOS 26 pools' pin (pr_runner_pool.py).
                     owned = OWNED_POOL.fullmatch(label)
@@ -233,12 +293,16 @@ def parse_selectors(text: str) -> list[str]:
 
 
 def plan(args: argparse.Namespace, api: Callable[[str], dict] = gh_api) -> dict:
+    repository_name(args.repository)
+    fetch = lambda revision: fetch_commit(revision, repository=args.repository)
     head = git("rev-parse", f"{args.ref}^{{commit}}")
     selectors = parse_selectors(args.only_testing)
     if args.source_run_id:
         run = api(f"repos/{args.repository}/actions/runs/{args.source_run_id}")
+        if not belongs_to_repository(run, args.repository, resource="actions/runs/"):
+            raise SystemExit(f"run {args.source_run_id} belongs to another repository")
         try:
-            revision = built_revision(run)
+            revision = built_revision(run, fetch=fetch)
         except ValueError as error:
             raise SystemExit(str(error))
         except subprocess.CalledProcessError:
@@ -264,7 +328,7 @@ def plan(args: argparse.Namespace, api: Callable[[str], dict] = gh_api) -> dict:
 
         def resolve(run: dict, revision: str) -> str | None:
             try:
-                built = built_revision(run)
+                built = built_revision(run, fetch=fetch)
                 return built if built == revision or not non_test_changes(built, head) else None
             except (KeyError, ValueError, subprocess.CalledProcessError):
                 return None
@@ -693,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     plan_parser = commands.add_parser("plan")
     plan_parser.add_argument("--ref", required=True)
-    plan_parser.add_argument("--repository", required=True)
+    plan_parser.add_argument("--repository", required=True, type=repository_name)
     plan_parser.add_argument("--only-testing", required=True)
     plan_parser.add_argument("--source-run-id", default="")
     plan_parser.add_argument("--max-commits", type=int, default=200)
@@ -711,7 +775,7 @@ def main(argv: list[str] | None = None) -> int:
     prune_parser.add_argument("--only-testing", required=True)
     prune_parser.add_argument("--target", default=TEST_TARGET)
     download_parser = commands.add_parser("download")
-    download_parser.add_argument("--repository", required=True)
+    download_parser.add_argument("--repository", required=True, type=repository_name)
     download_parser.add_argument("--run-id", required=True)
     download_parser.add_argument("--artifact-id", required=True, type=int)
     download_parser.add_argument("--artifact-name", required=True)

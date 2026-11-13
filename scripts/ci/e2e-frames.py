@@ -27,12 +27,17 @@ import argparse
 import contextlib
 import html
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from app_host_test_rerun import repository_name  # noqa: E402
 
 REPO = "manaflow-ai/cmux"
 FRAMES_ARTIFACT = "ui-frames"
@@ -58,24 +63,75 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def parse_run_id(value: str) -> str | None:
-    if value.isdigit():
-        return value
-    match = re.search(r"/actions/runs/(\d+)", value)
-    return match.group(1) if match else None
+    source = parse_run_source(value)
+    return source[0] if source else None
+
+
+def parse_run_source(value: str) -> tuple[str, str | None] | None:
+    if re.fullmatch(r"[1-9][0-9]{0,19}", value):
+        return value, None
+    try:
+        url = urlsplit(value)
+        match = re.fullmatch(r"/([^/]+)/([^/]+)/actions/runs/([1-9][0-9]{0,19})/?", url.path)
+        if url.scheme == "https" and url.netloc.casefold() == "github.com" and match:
+            return match[3], repository_name(f"{match[1]}/{match[2]}")
+    except ValueError:
+        pass
+    return None
+
+
+def download_binding(path: Path, expected: dict) -> None:
+    """A retained marker may confirm only the caller's exact original."""
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024:
+        raise ValueError(f"unbound frame artifact metadata: {path}")
+    try:
+        actual = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"unreadable frame artifact metadata: {path}") from error
+    if actual != expected:
+        raise ValueError(f"frame artifact belongs to another original: {path}")
+
+
+def publish_download_binding(path: Path, expected: dict) -> None:
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        download_binding(path, expected)
+        return
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump(expected, handle, sort_keys=True)
+        handle.write("\n")
 
 
 def download(run_id: str, repo: str, name: str, into: Path) -> bool:
-    """Download an artifact once; a marker, not a non-empty directory, says it arrived, since a
-    local fallback build writes into the same place."""
+    """Retain source custody before downloading, and success only after gh accepts it.
+
+    An old unbound marker or another repository/run's files require explicit
+    reconciliation; neither can authorize overwriting or accepting those bytes.
+    """
+    repo = repository_name(repo)
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id) or name not in (FRAMES_ARTIFACT, RESULTS_ARTIFACT):
+        raise ValueError("invalid frame artifact source")
+    source = {"format": "cmux-frame-download.v1", "repository": repo.casefold(), "run_id": run_id}
+    binding = into / ".download-source.json"
     marker = into / f".downloaded-{name}"
-    if marker.exists():
-        return True
+    expected_marker = {**source, "artifact": name}
     into.mkdir(parents=True, exist_ok=True)
+    if binding.exists() or binding.is_symlink():
+        download_binding(binding, source)
+    else:
+        if any(into.iterdir()):
+            raise ValueError(f"frame output has no original repository/run binding: {into}")
+        publish_download_binding(binding, source)
+    if marker.exists() or marker.is_symlink():
+        download_binding(marker, expected_marker)
+        return True
     done = subprocess.run(["gh", "run", "download", run_id, "--repo", repo, "-n", name, "-D", str(into)],
                           capture_output=True, text=True)
     if done.returncode != 0:
         return False
-    marker.touch()
+    download_binding(binding, source)
+    publish_download_binding(marker, expected_marker)
     return True
 
 
@@ -390,23 +446,30 @@ def main() -> int:
     parser.add_argument("source", help="run id, run URL, an .xcresult, or a directory of them")
     parser.add_argument("--test", help="only tests whose Class/method contains this substring")
     parser.add_argument("--out", type=Path, help="output directory (default: $TMPDIR/cmux-ui-frames/<run>)")
-    parser.add_argument("--repo", default=REPO)
+    parser.add_argument("--repo", type=repository_name,
+                        help="OWNER/NAME (default: run URL's repository, otherwise manaflow-ai/cmux)")
     parser.add_argument("--summary", type=Path, help="append a Markdown report to this file")
     parser.add_argument("--json", action="store_true", help="print the summary as JSON")
     args = parser.parse_args()
 
     local = Path(args.source)
-    run_id = None if local.exists() else parse_run_id(args.source)
+    run_source = None if local.exists() else parse_run_source(args.source)
+    run_id = run_source[0] if run_source else None
     if not local.exists() and not run_id:
         parser.error("source must be a run id, a run URL, an .xcresult, or a directory of them")
-    out = args.out or Path(tempfile.gettempdir()) / "cmux-ui-frames" / (run_id or local.stem)
+    url_repository = run_source[1] if run_source else None
+    if args.repo and url_repository and args.repo.casefold() != url_repository.casefold():
+        parser.error("--repo disagrees with the run URL's repository")
+    repository = args.repo or url_repository or REPO
+    output_identity = Path(repository.casefold()) / run_id if run_id else Path(local.stem)
+    out = args.out or Path(tempfile.gettempdir()) / "cmux-ui-frames" / output_identity
 
-    if run_id and download(run_id, args.repo, FRAMES_ARTIFACT, out):
+    if run_id and download(run_id, repository, FRAMES_ARTIFACT, out):
         summary = load_built(out, args.test)
     else:
         if run_id:
             bundles = out / ".download"
-            if not download(run_id, args.repo, RESULTS_ARTIFACT, bundles):
+            if not download(run_id, repository, RESULTS_ARTIFACT, bundles):
                 sys.exit(f"run {run_id} has neither '{FRAMES_ARTIFACT}' nor '{RESULTS_ARTIFACT}'; "
                          "a run that failed before its tests uploads nothing (see its log)")
             local = bundles
