@@ -1038,15 +1038,18 @@ struct ProcessDetectedStartupOwnershipTests {
 
     @Test(arguments: ["workspace", "workspaceDock", "globalDock"], ["tmux", "ssh"])
     func workspaceDoesNotAdoptUnownedAutomaticProcessBindings(origin: String, kind: String) throws {
-        for hasForeignGeneration in [false, true] {
+        for ownership in ["unarmed", "foreignGeneration", "changedCommand"] {
             let source = Workspace()
             defer { source.teardownAllPanels() }
             let destination = Workspace()
             defer { destination.teardownAllPanels() }
             let terminal = try stagedTerminal(in: source, kind: kind)
             var unowned = binding(kind: kind)
-            if hasForeignGeneration {
+            if ownership == "foreignGeneration" {
                 unowned.armRestoredProcessDetectionObservation(terminalLifecycleID: UUID())
+            } else if ownership == "changedCommand" {
+                unowned = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+                unowned.command += " --changed-invocation"
             }
             source.surfaceResumeBindingsByPanelId[terminal.id] = unowned
             var transfer = try #require(source.detachSurface(panelId: terminal.id))
@@ -1076,13 +1079,18 @@ struct ProcessDetectedStartupOwnershipTests {
         let source = Workspace()
         defer { source.teardownAllPanels() }
         let terminal = try stagedTerminal(in: source)
-        let original = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+        var original = try #require(source.surfaceResumeBinding(panelId: terminal.id))
+        original.approvalPolicy = .auto
+        original.approvalRecordId = "previously-approved-owned-restore"
+        source.surfaceResumeBindingsByPanelId[terminal.id] = original
         let transfer = try #require(source.detachSurface(panelId: terminal.id))
         let dock = DockSplitStore(workspaceId: UUID(), scope: scope, baseDirectoryProvider: { "/tmp" })
         defer { dock.closeAllPanels() }
         let pane = try #require(dock.bonsplitController.allPaneIds.first)
         let panelID = try #require(dock.attachDetachedSurface(transfer, inPane: pane, focus: false))
         let index: SurfaceResumeBindingIndex? = detection == "unavailable" ? .unavailable : nil
+        let generation = terminal.surface.terminalLifecycleId
+        #expect(terminal.surface.isAwaitingStartupRestoreAdmission)
 
         for forceManualRecovery in [false, true] {
             dock.surfaceResumeBindingsByPanelId[panelID] = original
@@ -1097,6 +1105,8 @@ struct ProcessDetectedStartupOwnershipTests {
             #expect(saved.command == original.command)
             #expect(saved.launchCommand == original.launchCommand)
             #expect(saved.autoResume == !forceManualRecovery)
+            #expect(terminal.surface.terminalLifecycleId == generation)
+            #expect(terminal.surface.isAwaitingStartupRestoreAdmission)
             if forceManualRecovery {
                 #expect(saved.approvalPolicy == .manual)
                 #expect(saved.approvalRecordId == nil)
