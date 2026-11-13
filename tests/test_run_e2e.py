@@ -133,9 +133,10 @@ elif args[:2] == ["run", "list"]:
         print(os.environ.get("LAUNCHER_PRIOR_RUNS", "[]"))
         sys.exit(0)
     fields = json.loads((root / "dispatch.json").read_text())
+    repository = args[args.index("--repo") + 1]
     print(json.dumps([
-        {"databaseId": 999, "displayTitle": "someone else's newer run", "url": "https://github.com/manaflow-ai/cmux/actions/runs/999"},
-        {"databaseId": 123, "displayTitle": fields["test_filter"] + " on mac @ " + fields.get("ref", "main") + " [" + fields.get("dispatch_id", "") + "]", "url": "https://github.com/manaflow-ai/cmux/actions/runs/123"}
+        {"databaseId": 999, "displayTitle": "someone else's newer run", "url": f"https://github.com/{repository}/actions/runs/999"},
+        {"databaseId": 123, "displayTitle": fields["test_filter"] + " on mac @ " + fields.get("ref", "main") + " [" + fields.get("dispatch_id", "") + "]", "url": f"https://github.com/{repository}/actions/runs/123"}
     ]))
 elif args[:2] == ["run", "watch"]:
     sys.exit(int(os.environ.get("LAUNCHER_WATCH_STATUS", "0")))
@@ -446,6 +447,42 @@ class FocusedLauncherTests(unittest.TestCase):
         result = self.launch("cmuxTests/ExampleTests/testOne", "--ref", "topic/fix")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.dispatch()["ref"], REMOTE_HEAD)
+
+    def test_explicit_repository_owns_resolution_dispatch_discovery_and_watch(self):
+        repository = "derrickburns/cmux"
+        result = self.launch(
+            "cmuxTests/ExampleTests", "--repository", repository,
+            "--ref", "topic/fix", "--wait",
+            GH_REPO="unrelated/ambient",
+            CMUX_MACOS_RUNNER_TESTS=MINI,
+            LAUNCHER_VARIABLES=json.dumps([{"name": "MACOS_RUNNER_TESTS", "value": MINI}]),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.dispatch()["ref"], REMOTE_HEAD)
+        self.assertNotIn("runner", self.dispatch(), "the workflow owns the fork's hosted choice")
+        self.assertIn(f"https://github.com/{repository}/actions/runs/123", result.stdout)
+        calls = self.calls()
+        self.assertFalse(any(call[:2] == ["variable", "list"] for call in calls), calls)
+        for call in calls:
+            if call[:1] == ["api"]:
+                endpoint = call[-1]
+                self.assertTrue(endpoint.startswith(f"repos/{repository}/"), call)
+            if call[:2] in (["run", "list"], ["run", "watch"], ["workflow", "run"]):
+                self.assertEqual(call[call.index("--repo") + 1], repository, call)
+        self.assertIn(f"{repository}/123 --timeout 14400", (self.root / "glaeda.calls").read_text())
+
+    def test_invalid_repository_and_fork_provider_choices_refuse_before_github(self):
+        invalid = ["", "owner", "owner/repo/extra", "https://github.com/owner/repo",
+                   "owner/..", "../repo", "owner/repo?ref=main", "owner/repo\n", "-owner/repo"]
+        for repository in invalid:
+            with self.subTest(repository=repository):
+                result = self.launch("cmuxTests/ExampleTests", "--repository", repository)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls(), [])
+        result = self.launch("cmuxTests/ExampleTests", "--repository", "derrickburns/cmux",
+                             "--runner", MINI)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [])
 
     def test_explicit_runner_reaches_the_workflow_dispatch(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/test-e2e.yml").read_text())
@@ -1182,6 +1219,58 @@ class FocusedLauncherTests(unittest.TestCase):
         self.assertEqual(len(guard_reads), 1, guard_reads)
 
 
+
+
+class RepositoryOwnerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "repository_dispatch", ROOT / "scripts/ci/dispatch-focused-test.py"
+        )
+        cls.dispatch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.dispatch)
+
+    def test_fork_auto_ignores_organization_provider_configuration(self):
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.dict(os.environ, {"CMUX_MACOS_RUNNER_TESTS": MINI}), \
+                mock.patch.object(self.dispatch, "listed_variables", side_effect=AssertionError("queried variables")), \
+                mock.patch.object(self.dispatch.pool, "auto_runner", side_effect=AssertionError("queried organization pool")):
+            self.assertEqual(self.dispatch.default_runner(), "macos-26")
+            self.assertEqual(self.dispatch.routed_runner(MINI, "cmuxTests"), "macos-26")
+
+    def test_history_cannot_adopt_another_repositories_run(self):
+        foreign = {"databaseId": 123, "url": "https://github.com/manaflow-ai/cmux/actions/runs/123"}
+        owned = {**foreign, "url": "https://github.com/derrickburns/cmux/actions/runs/123"}
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"):
+            self.assertFalse(self.dispatch.watchable(foreign))
+            self.assertTrue(self.dispatch.watchable(owned))
+
+    def test_exact_dispatch_discovery_refuses_a_foreign_repository(self):
+        foreign = {"databaseId": 123, "displayTitle": "cmuxTests/Example on macos-26 @ " + HEAD + " [mine]",
+                   "url": "https://github.com/manaflow-ai/cmux/actions/runs/123"}
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch, "output", return_value=json.dumps([foreign])), \
+                mock.patch.object(self.dispatch, "wait_for_retry", return_value=False):
+            with self.assertRaisesRegex(ValueError, "before dispatching again"):
+                self.dispatch.find_run(HEAD, "cmuxTests/Example", "mine")
+
+    def test_product_wait_never_adopts_a_foreign_repository_producer(self):
+        foreign = {"id": 123, "path": ".github/workflows/ci.yml", "event": "push", "status": "in_progress",
+                   "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/123"}
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch.rerun, "gh_api", return_value={"workflow_runs": [foreign]}), \
+                mock.patch.object(self.dispatch.rerun, "built_revision", return_value=HEAD), \
+                mock.patch.object(self.dispatch.rerun, "non_test_changes", return_value=[]):
+            self.assertIsNone(self.dispatch.building_producer(HEAD))
+
+    def test_frame_result_owner_receives_the_selected_repository(self):
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch, "watch_run", return_value=0), \
+                mock.patch.object(self.dispatch.subprocess, "run") as run:
+            self.assertEqual(self.dispatch.watch_and_extract(123, True), 0)
+        command = run.call_args.args[0]
+        self.assertIn("--repo", command)
+        self.assertEqual(command[command.index("--repo") + 1], "derrickburns/cmux")
 
 
 class RunDiscoveryTests(unittest.TestCase):
