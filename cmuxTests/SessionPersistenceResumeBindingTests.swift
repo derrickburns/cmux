@@ -768,9 +768,13 @@ struct ProcessDetectedStartupOwnershipTests {
         defer { workspace.teardownAllPanels() }
         var snapshot = workspace.sessionSnapshot(includeScrollback: false)
         let original = binding(kind: kind)
+        #expect(original.approvalPolicy == nil)
+        var approvedOriginal = original
+        approvedOriginal.approvalPolicy = .auto
         snapshot.panels[0].terminal?.resumeBinding = original
         workspace.restoreSessionSnapshot(snapshot)
         let panelID = try #require(workspace.focusedPanelId)
+        let terminal = try #require(workspace.terminalPanel(for: panelID))
         #expect(!workspace.restoredAgentLifecycle.ownsInFlightRestoredCommand(panelId: panelID))
         #expect(workspace.restoredAgentLifecycle.startupInput(panelId: panelID) == nil)
         for _ in 0..<8 {
@@ -778,7 +782,14 @@ struct ProcessDetectedStartupOwnershipTests {
                 includeScrollback: false,
                 surfaceResumeBindingIndex: .empty
             )
-            #expect(saved.panels.first?.terminal?.resumeBinding == original)
+            #expect(saved.panels.first?.terminal?.resumeBinding == approvedOriginal)
+            let observation = try #require(
+                workspace.surfaceResumeBinding(panelId: panelID)?.restoredProcessDetectionObservation
+            )
+            #expect(observation.phase == .queued)
+            #expect(observation.terminalLifecycleID == terminal.surface.terminalLifecycleId)
+            #expect(observation.originalUpdatedAt == original.updatedAt)
+            #expect(observation.identity.matches(original))
         }
         let detected = SurfaceResumeBindingIndex(bindingsByPanel: [
             .init(workspaceId: workspace.id, panelId: panelID): original
@@ -1176,8 +1187,11 @@ struct ProcessDetectedStartupOwnershipTests {
         defer { dock.closeAllPanels() }
         let pane = try #require(dock.bonsplitController.allPaneIds.first)
         let panelID = try #require(dock.attachDetachedSurface(transfer, inPane: pane, focus: false))
+        let detectedBinding = binding()
+        #expect(detectedBinding.restoredProcessDetectionObservation == nil)
+        #expect(original.restoredProcessDetectionObservation?.identity.matches(detectedBinding) == true)
         let detected = SurfaceResumeBindingIndex(bindingsByPanel: [
-            .init(workspaceId: dock.workspaceId, panelId: panelID): original
+            .init(workspaceId: dock.workspaceId, panelId: panelID): detectedBinding
         ])
 
         let snapshot = dock.sessionSnapshot(
