@@ -114,7 +114,9 @@ class Git:
         with their contents, which is slower but routes the same. When both
         fail the delta does not apply, and the reason carries git's stderr.
         """
-        attempts = ((object_filter, *args), args)
+        # Omitting --filter inherits remote.<name>.partialclonefilter, which
+        # the failed first attempt may already have registered.
+        attempts = ((object_filter, *args), ("--no-filter", *args))
         for index, attempt in enumerate(attempts):
             try:
                 self.run("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", *attempt)
