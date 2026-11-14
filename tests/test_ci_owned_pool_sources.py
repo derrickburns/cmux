@@ -132,7 +132,10 @@ def comparison_api(path: str):
     """Bounded public source metadata, using the existing read token when supplied."""
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if token:
+    # The workflow token belongs to its current repository. The official
+    # counterpart is public data, not an assumed installation permission.
+    requested_repository = "/".join(path.split("/", 2)[:2])
+    if token and requested_repository.lower() == os.environ.get("GITHUB_REPOSITORY", "").lower():
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request("https://api.github.com/repos/" + path, headers=headers)
     try:
