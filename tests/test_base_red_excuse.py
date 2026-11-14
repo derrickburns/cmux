@@ -791,7 +791,10 @@ class DependencyRollups(unittest.TestCase):
                              ("status", "in_progress"), ("id", 777)):
             with self.subTest(field=field):
                 self.setUp()
-                self.gh.logical[10]["linux-preflight"][field] = value
+                # For ID, challenge the exact /jobs/<id> response selected by
+                # the required-check URL, not an unrelated nonexistent log.
+                target = "ci-status" if field == "id" else "linux-preflight"
+                self.gh.logical[10][target][field] = value
                 with self.assertRaises(excuse.Refused):
                     self.judge(True)
 
