@@ -94,6 +94,8 @@ CI_PROGRAMS = {
                   "4e52775680a43a6eacfe0584229e78162fb58b5eb47c2cac0ab42ce91437784c"),
 }
 LOG_COLOR = re.compile(r"(?:\x1b|\^\[)\[[0-9;]*m")
+RUN_IDENTITY = ("id", "head_sha", "head_branch", "workflow_id", "path", "run_attempt",
+                "status", "conclusion", "event")
 
 
 def lines_of(log: str) -> list[str]:
@@ -210,21 +212,61 @@ def unique_json(pairs):
     return result
 
 
+def run_metadata(repo: str, sha: str, run_id: int, github) -> dict:
+    meta = github.json(f"repos/{repo}/actions/runs/{run_id}")
+    if (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha)
+            or not isinstance(meta, dict) or meta.get("id") != run_id or meta.get("head_sha") != sha
+            or meta.get("status") != "completed" or meta.get("conclusion") != "failure"
+            or type(meta.get("run_attempt")) is not int or meta["run_attempt"] <= 0
+            or type(meta.get("workflow_id")) is not int or meta["workflow_id"] <= 0
+            or any(not isinstance(meta.get(k), str) or not meta[k] for k in ("head_branch", "path", "event"))
+            or not isinstance(meta.get("repository"), dict) or meta["repository"].get("full_name") != repo):
+        raise Refused("job inventory needs an exact completed source/run/workflow/attempt")
+    return meta
+
+
+def same_run(first: dict, second: dict) -> bool:
+    return all(first.get(k) == second.get(k) for k in RUN_IDENTITY)
+
+
+def job_inventory(repo: str, sha: str, run_id: int, github) -> dict:
+    """One complete original inventory, before selecting any failed jobs.
+
+    The API count is not a hint: missing, duplicate or foreign rows refuse.
+    Source and attempt must remain stable across collection and final audit.
+    """
+    meta = run_metadata(repo, sha, run_id, github)
+    pages = github.json(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100", paginate=True)
+    if (not isinstance(pages, list) or not pages or any(not isinstance(p, dict) for p in pages)
+            or any(type(p.get("total_count")) is not int or not isinstance(p.get("jobs"), list) for p in pages)
+            or len({p["total_count"] for p in pages}) != 1 or not 1 <= pages[0]["total_count"] <= 5000):
+        raise Refused("run has no complete bounded job inventory")
+    jobs = [job for page in pages for job in page["jobs"]]
+    if len(jobs) != pages[0]["total_count"]:
+        raise Refused("run job inventory is partial")
+    by_id, by_name = {}, {}
+    for job in jobs:
+        if (not isinstance(job, dict) or type(job.get("id")) is not int or job["id"] <= 0
+                or job["id"] in by_id or not isinstance(job.get("name"), str) or not job["name"]
+                or job["name"] in by_name or job.get("run_id") != run_id
+                or job.get("head_sha") != sha or job.get("status") != "completed"):
+            raise Refused("run has duplicate, incomplete or foreign job identity")
+        by_id[job["id"]] = job
+        by_name[job["name"]] = job
+    if not same_run(meta, run_metadata(repo, sha, run_id, github)):
+        raise Refused("source/run/attempt changed during job inventory collection")
+    return {"meta": meta, "jobs": jobs, "by_id": by_id, "by_name": by_name}
+
+
 def dependency_run(repo: str, sha: str, run_id: int, github) -> dict:
     """Read one closed CI source/initial-attempt context, without executing it.
 
     A new workflow source or rerun needs its own reader. The source pin binds
     the graph, display names, route predicates and program slices below.
     """
-    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
-        raise Refused("dependency attribution needs an exact source SHA")
-    meta = github.json(f"repos/{repo}/actions/runs/{run_id}")
-    if (not isinstance(meta, dict) or meta.get("id") != run_id or meta.get("head_sha") != sha
-            or meta.get("path") != CI_SOURCE or meta.get("status") != "completed"
-            or meta.get("conclusion") != "failure" or meta.get("run_attempt") != 1
-            or type(meta.get("workflow_id")) is not int or meta["workflow_id"] <= 0
-            or not isinstance(meta.get("head_branch"), str) or not meta["head_branch"]
-            or not isinstance(meta.get("repository"), dict) or meta["repository"].get("full_name") != repo):
+    context = job_inventory(repo, sha, run_id, github)
+    meta = context["meta"]
+    if meta["path"] != CI_SOURCE or meta["run_attempt"] != 1:
         raise Refused("dependency attribution needs an exact completed source/run/workflow original attempt")
     source = github.json(f"repos/{repo}/contents/{CI_SOURCE}?ref={sha}")
     if (not isinstance(source, dict) or source.get("type") != "file" or source.get("path") != CI_SOURCE
@@ -251,24 +293,7 @@ def dependency_run(repo: str, sha: str, run_id: int, github) -> dict:
         if match is None:
             break
         outputs.add(match[1])
-    pages = github.json(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100", paginate=True)
-    if (not isinstance(pages, list) or not pages or any(not isinstance(p, dict) for p in pages)
-            or any(type(p.get("total_count")) is not int or not isinstance(p.get("jobs"), list) for p in pages)
-            or len({p["total_count"] for p in pages}) != 1 or not 1 <= pages[0]["total_count"] <= 5000):
-        raise Refused("dependency run has no complete bounded job inventory")
-    jobs = [job for page in pages for job in page["jobs"]]
-    if len(jobs) != pages[0]["total_count"]:
-        raise Refused("dependency run job inventory is partial")
-    by_id, by_name = {}, {}
-    for job in jobs:
-        if (not isinstance(job, dict) or type(job.get("id")) is not int or job["id"] <= 0
-                or job["id"] in by_id or not isinstance(job.get("name"), str) or job["name"] in by_name
-                or job.get("run_id") != run_id or job.get("head_sha") != sha or job.get("status") != "completed"):
-            raise Refused("dependency run has duplicate, incomplete or foreign job identity")
-        by_id[job["id"]] = job
-        by_name[job["name"]] = job
-    return {"meta": meta, "jobs": jobs, "by_id": by_id, "by_name": by_name,
-            "programs": programs, "outputs": outputs, "rollups": {}}
+    return {**context, "programs": programs, "outputs": outputs, "rollups": {}}
 
 
 def dependency_group(context: dict, name: str, result: str) -> list[dict]:
@@ -427,32 +452,34 @@ def dependency_rollup(context: dict, name: str, github, repo: str) -> dict:
     return result
 
 
-def head_jobs(repo: str, sha: str, runs: list[int], checks: list[str], github) -> list[dict]:
+def head_jobs(repo: str, sha: str, runs: list[int], checks: list[str], github, inventories: dict) -> list[dict]:
     jobs: dict[int, dict] = {}
+
+    def collect(run):
+        snapshot = job_inventory(repo, sha, run, github)
+        if run in inventories and (not same_run(inventories[run]["meta"], snapshot["meta"])
+                                   or inventories[run]["by_id"] != snapshot["by_id"]):
+            raise Refused("selected run has conflicting complete job snapshots")
+        inventories[run] = snapshot
+        for job in snapshot["jobs"]:
+            if job.get("conclusion") not in ("success", "skipped", "neutral"):
+                jobs[job["id"]] = job
+
     for run in runs:
-        for page in github.json(f"repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100", paginate=True):
-            for job in page.get("jobs") or []:
-                if job.get("status") == "completed" and job.get("conclusion") not in ("success", "skipped", "neutral"):
-                    if job.get("head_sha") not in (None, sha):
-                        raise Refused(f"{job.get('name')}: job is not for the exact SHA {sha}")
-                    jobs[job["id"]] = job
+        collect(run)
     if checks:
         latest = latest_checks(repo, sha, github)
-        aggregate_runs = []
         for name in checks:
             if name not in latest:
                 raise Refused(f"{name}: has not run on exact head {sha}")
             job = job_for(repo, latest[name], sha, github)
             if job.get("id") != int(latest[name]["details_url"].rsplit("/", 1)[1]):
                 raise Refused(f"{name}: job response is not the original required-check identity")
-            jobs[job["id"]] = job
-            if name in DEPENDENCY_JOBS:
-                aggregate_runs.append(job["run_id"])
-        for run in aggregate_runs:
-            found = head_jobs(repo, sha, [run], [], github)
-            if not found:
-                raise Refused(f"run {run}: its aggregate check failed with no failed job to compare with the base")
-            jobs.update((job["id"], job) for job in found)
+            collect(job["run_id"])
+            listed = inventories[job["run_id"]]["by_id"].get(job["id"])
+            keys = ("id", "run_id", "head_sha", "name", "status", "conclusion", "steps")
+            if listed is None or any(job.get(k) != listed.get(k) for k in keys):
+                raise Refused(f"{name}: required-check job differs from its complete original inventory")
     return list(jobs.values())
 
 
@@ -461,7 +488,8 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
     audit: list[str] = []
     base_runs: dict[int, list[dict]] = {}
     base_jobs: dict[int, list[dict]] = {}
-    jobs = head_jobs(repo, sha, runs, list(checks), github)
+    inventories = {}
+    jobs = head_jobs(repo, sha, runs, list(checks), github, inventories)
     if not jobs:
         # A red run or check with no failed job to show has nothing the base can excuse.
         raise Refused("no failed job found on the head to compare with the base")
@@ -471,6 +499,9 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
     for job in jobs:
         if job.get("name") in DEPENDENCY_JOBS and job["run_id"] not in contexts:
             context = dependency_run(repo, sha, job["run_id"], github)
+            selected = inventories[job["run_id"]]
+            if not same_run(selected["meta"], context["meta"]) or selected["by_id"] != context["by_id"]:
+                raise Refused("dependency context differs from the complete selected job snapshot")
             # Both owners must be explained, including ci-status's independent
             # routing logic; a direct --run is not a weaker entry point.
             dependency_rollup(context, "ci-status", github, repo)
@@ -517,6 +548,8 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
                         or base_run.get("workflow_id") != workflow):
                     raise Refused(f"{name}: base source/workflow/branch differs")
                 dependency_rollup(context, "ci-status", github, repo)
+                if {j["id"]: j for j in base_jobs[base_run["id"]]} != context["by_id"]:
+                    raise Refused("base dependency context differs from its original job snapshot")
                 contexts[base_run["id"]] = context
             base_context = contexts[base_run["id"]]
             if base_context["by_id"].get(base_job["id"]) != base_job:
@@ -566,11 +599,10 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
                      f"failed leaves independently audited; skipped work unexecuted: {', '.join(skipped) or 'none'}; "
                      + ("later platform assertions and Check routed CI jobs unexecuted" if job["name"] == "ci-status"
                         else "no skipped work is called passing"))
-    for run_id, context in contexts.items():
-        current = github.json(f"repos/{repo}/actions/runs/{run_id}")
-        keys = ("id", "head_sha", "head_branch", "workflow_id", "path", "run_attempt", "status", "conclusion")
-        if not isinstance(current, dict) or any(current.get(k) != context["meta"].get(k) for k in keys):
-            raise Refused("dependency run/attempt changed during the original audit")
+    for run_id, context in {**inventories, **contexts}.items():
+        current = run_metadata(repo, context["meta"]["head_sha"], run_id, github)
+        if not same_run(current, context["meta"]):
+            raise Refused("run/attempt changed during the original audit")
     return audit
 
 
