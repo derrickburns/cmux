@@ -77,7 +77,7 @@ extension DockSplitStore {
                     downgradeStoredProcessDetectedResumeBindingsWhenDetectionUnavailable:
                         downgradeStoredProcessDetectedResumeBindingsWhenDetectionUnavailable,
                     detectedResumeBindingIsAmbiguous: surfaceResumeBindingIndex?.hasAmbiguousPanel(panelId) == true,
-                    resumeBindingDetectionUnavailable: surfaceResumeBindingIndex?.isAvailable == false,
+                    resumeBindingDetectionUnavailable: surfaceResumeBindingIndex?.isAvailable != true,
                     terminalFontSizeSnapshotProjection:
                         terminalFontSizeSnapshotProjection,
                     notificationStore: notificationStore,
@@ -511,7 +511,23 @@ extension DockSplitStore {
         detectedIsAmbiguous: Bool,
         detectionUnavailable: Bool = false
     ) -> SurfaceResumeBindingSnapshot? {
-        let stored = surfaceResumeBindingsByPanelId[panelId]
+        var stored = surfaceResumeBindingsByPanelId[panelId]
+        // Explicit teardown recovery must remove automatic authority even
+        // while startup is queued. Ordinary missing scans still retain custody.
+        if !detectedIsAmbiguous,
+           !(downgradeStoredProcessDetectedResumeBindingWhenDetectionUnavailable && detected == nil),
+           var restoredBinding = stored {
+            let previousObservation = restoredBinding.restoredProcessDetectionObservation
+            let preserves = restoredBinding.reconcileRestoredProcessDetection(
+                detected: detected,
+                detectionAvailable: !detectionUnavailable
+            )
+            if previousObservation != restoredBinding.restoredProcessDetectionObservation {
+                surfaceResumeBindingsByPanelId[panelId] = restoredBinding
+            }
+            stored = restoredBinding
+            if preserves { return restoredBinding }
+        }
         if let stored,
            stored.hasCompleteManagedSessionIdentity,
            managedAgentResumeBindingsByPanelId[panelId] == nil {

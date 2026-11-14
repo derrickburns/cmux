@@ -1,4 +1,18 @@
 extension TerminalSurface {
+    /// Removes queued restore input only after its owner accepts a real failure.
+    /// Generic startup commands and stale/replaced generations keep their existing policy.
+    @MainActor
+    func reportStartupRestoreRuntimeFailure() {
+        guard reportedStartupRestoreRuntimeFailureGeneration != terminalLifecycleId,
+              onStartupRestoreAbandoned?(terminalLifecycleId) == true else { return }
+        reportedStartupRestoreRuntimeFailureGeneration = terminalLifecycleId
+        nextRuntimeInitialInput = nil
+        startupRestoreAdmissionCommandOverride = nil
+        hasStartupRestoreAdmissionCommandOverride = true
+        suppressConfiguredInitialInput = true
+        startupInputGate.cancel(generation: terminalLifecycleId)
+    }
+
     /// Whether the owning container still holds this terminal for restore admission.
     public var isAwaitingStartupRestoreAdmission: Bool {
         startupRestoreAdmissionPhase == .awaitingAdmission
@@ -37,6 +51,8 @@ extension TerminalSurface {
         hasStartupRestoreAdmissionCommandOverride = true
         suppressConfiguredInitialInput = true
         startupRestoreAdmissionPhase = .admitted
+        startupInputGate.cancel(generation: terminalLifecycleId)
+        _ = onStartupRestoreAbandoned?(terminalLifecycleId)
         scheduleHeadlessRuntimeStartIfNeeded(reason: "startup-restore-cancelled")
     }
 
@@ -49,6 +65,8 @@ extension TerminalSurface {
         hasStartupRestoreAdmissionCommandOverride = true
         suppressConfiguredInitialInput = true
         startupRestoreAdmissionPhase = .admitted
+        startupInputGate.cancel(generation: terminalLifecycleId)
+        _ = onStartupRestoreAbandoned?(terminalLifecycleId)
         // User input is an immediate runtime demand; do not make the first
         // keystroke wait behind the unrelated paced-restore queue.
         scheduleHeadlessRuntimeStartIfNeeded(

@@ -29,6 +29,14 @@ extension Workspace {
             // The user (or a socket client) took over the pane: never replay a
             // lost restore selector into a line they are typing.
             self.restoredAgentLifecycle.clearStartupInput(panelId: terminalPanel.id)
+            if let mountedTerminal = self.panels[terminalPanel.id] as? TerminalPanel,
+               mountedTerminal === terminalPanel,
+               var binding = self.surfaceResumeBindingsByPanelId[terminalPanel.id],
+               binding.retireRestoredProcessDetection(
+                    terminalLifecycleID: terminalPanel.surface.terminalLifecycleId
+               ) {
+                self.surfaceResumeBindingsByPanelId[terminalPanel.id] = binding
+            }
             // Terminal input is the shared answer path for agent prompts. Clear
             // only the oldest matching agent attention record here so an
             // unrelated notification on the same surface keeps its ring.
@@ -37,6 +45,19 @@ extension Workspace {
                 tabId: self.id,
                 surfaceId: terminalPanel.id
             )
+        }
+        terminalPanel.surface.onStartupRestoreAbandoned = { [weak self, weak terminalPanel] generation in
+            guard let self, let terminalPanel,
+                  generation == terminalPanel.surface.terminalLifecycleId,
+                  let mountedTerminal = self.panels[terminalPanel.id] as? TerminalPanel,
+                  mountedTerminal === terminalPanel,
+                  var binding = self.surfaceResumeBindingsByPanelId[terminalPanel.id],
+                  binding.retireRestoredProcessDetection(terminalLifecycleID: generation) else {
+                return false
+            }
+            self.surfaceResumeBindingsByPanelId[terminalPanel.id] = binding
+            self.restoredAgentLifecycle.clearStartupInput(panelId: terminalPanel.id)
+            return true
         }
         terminalPanel.surface.onStartupRestoreAdmissionCancelled = { [weak self, weak terminalPanel] in
             guard let self, let terminalPanel,

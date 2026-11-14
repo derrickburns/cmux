@@ -182,8 +182,7 @@ public struct WorkspaceSessionRestorePolicyService<Binding: WorkspaceSurfaceResu
     /// - Parameter rawCommand: The persisted terminal startup command.
     /// - Returns: The validated attach command, or `nil` for ordinary commands.
     public func localTmuxStartCommand(_ rawCommand: String?) -> String? {
-        LocalTmuxRestoreCommandPolicy().restorableCommand(rawCommand)
-            ?? LocalZellijRestoreCommandPolicy().restorableCommand(rawCommand)
+        LocalSessionRestoreCommand(rawCommand)?.command
     }
 
     /// Returns whether terminal scrollback should be persisted when closing/restoring.

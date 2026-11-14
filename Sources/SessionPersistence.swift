@@ -348,6 +348,57 @@ enum SurfaceResumeApprovalPolicy: String, Codable, CaseIterable, Sendable {
     case auto
 }
 
+/// Ephemeral ownership of one admitted process-backed restore generation.
+/// This is carried by surface transfers, but never written into a session file.
+/// Empty scans are observations, not terminal outcomes; no clock retires this owner.
+struct RestoredProcessDetectionObservation: Equatable, Sendable {
+    enum Phase: Equatable, Sendable {
+        case queued
+        case commandRunning
+        case commandCompleted
+        case manualRecovery
+    }
+
+    let terminalLifecycleID: UUID
+    let originalUpdatedAt: TimeInterval
+    let identity: RestoredProcessDetectionIdentity
+    var phase: Phase = .queued
+
+    func owns(_ binding: SurfaceResumeBindingSnapshot) -> Bool {
+        originalUpdatedAt == binding.updatedAt && identity.matches(binding)
+    }
+}
+
+/// Compares the captured invocation, excluding scan timestamps and display metadata.
+/// tmux's canonical argv includes its executable, socket flags and exact target session.
+struct RestoredProcessDetectionIdentity: Equatable, Sendable {
+    let kind: String?
+    let source: String?
+    let command: String
+    let cwd: String?
+    let checkpointID: String?
+    let environment: [String: String]?
+    let launchCommand: AgentLaunchCommandSnapshot?
+    let launchFlavor: SurfaceResumeLaunchFlavor
+
+    init(_ binding: SurfaceResumeBindingSnapshot) {
+        kind = binding.kind
+        source = binding.source
+        command = binding.command
+        cwd = binding.cwd
+        checkpointID = binding.checkpointId
+        environment = binding.environment
+        var capture = binding.launchCommand
+        capture?.capturedAt = nil
+        launchCommand = capture
+        launchFlavor = binding.launchFlavor
+    }
+
+    func matches(_ binding: SurfaceResumeBindingSnapshot) -> Bool {
+        binding.isProcessDetected && self == Self(binding)
+    }
+}
+
 struct SurfaceResumeBindingSnapshot: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case name, kind, command, cwd, checkpointId, source
@@ -373,6 +424,8 @@ struct SurfaceResumeBindingSnapshot: Codable, Equatable, Sendable {
     var approvalRecordId: String?
     var launchFlavor: SurfaceResumeLaunchFlavor
     var updatedAt: TimeInterval
+    /// Startup ownership is process-local and is excluded by CodingKeys and equality.
+    var restoredProcessDetectionObservation: RestoredProcessDetectionObservation? = nil
 
     init(
         name: String? = nil,
@@ -443,6 +496,95 @@ struct SurfaceResumeBindingSnapshot: Codable, Equatable, Sendable {
             updatedAt: try container.decodeIfPresent(TimeInterval.self, forKey: .updatedAt)
                 ?? Date().timeIntervalSince1970
         )
+    }
+
+    /// Arms only a command already admitted by the ordinary trusted restore policy.
+    mutating func armRestoredProcessDetectionObservation(terminalLifecycleID: UUID) {
+        guard isProcessDetected, allowsAutomaticResume else { return }
+        restoredProcessDetectionObservation = RestoredProcessDetectionObservation(
+            terminalLifecycleID: terminalLifecycleID,
+            originalUpdatedAt: updatedAt,
+            identity: RestoredProcessDetectionIdentity(self)
+        )
+    }
+
+    /// Returns true while this exact stored invocation must win over an empty or
+    /// conflicting scan. Only a matching child settles startup successfully.
+    /// A completed command plus an available empty scan becomes manual recovery.
+    mutating func reconcileRestoredProcessDetection(
+        detected: Self?,
+        detectionAvailable: Bool
+    ) -> Bool {
+        guard let observation = restoredProcessDetectionObservation else {
+            // The ordinary persisted manual policy survives a relaunch without
+            // serializing process-local ownership or arming another automatic attempt.
+            return isProcessDetected && autoResume == false && approvalPolicy == .manual &&
+                approvalRecordId == nil && detected == nil
+        }
+        guard observation.owns(self) else {
+            restoredProcessDetectionObservation = nil
+            return false
+        }
+        guard detectionAvailable else { return true }
+        if let detected {
+            if observation.identity.matches(detected) || observation.phase == .manualRecovery {
+                restoredProcessDetectionObservation = nil
+                return false
+            }
+            return true
+        }
+        if observation.phase == .commandCompleted {
+            _ = retireRestoredProcessDetection(
+                terminalLifecycleID: observation.terminalLifecycleID
+            )
+        }
+        return true
+    }
+
+    /// Initial prompt markers cannot complete a command which has not started.
+    mutating func observeRestoredProcessDetectionShellState(
+        _ state: PanelShellActivityState,
+        terminalLifecycleID: UUID
+    ) {
+        guard var observation = restoredProcessDetectionObservation,
+              observation.terminalLifecycleID == terminalLifecycleID,
+              observation.owns(self) else { return }
+        switch (state, observation.phase) {
+        case (.commandRunning, .queued):
+            observation.phase = .commandRunning
+        case (.promptIdle, .commandRunning):
+            observation.phase = .commandCompleted
+        default:
+            return
+        }
+        restoredProcessDetectionObservation = observation
+    }
+
+    /// Retires only the original startup generation. Keep its exact command for
+    /// manual recovery while removing every automatic approval/replay capability.
+    @discardableResult
+    mutating func retireRestoredProcessDetection(terminalLifecycleID: UUID) -> Bool {
+        guard var observation = restoredProcessDetectionObservation,
+              observation.terminalLifecycleID == terminalLifecycleID,
+              observation.owns(self) else { return false }
+        observation.phase = .manualRecovery
+        restoredProcessDetectionObservation = observation
+        autoResume = false
+        approvalPolicy = .manual
+        approvalRecordId = nil
+        return true
+    }
+
+    /// Persisted equality intentionally excludes ephemeral startup ownership.
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.name == rhs.name && lhs.kind == rhs.kind &&
+            lhs.command == rhs.command && lhs.cwd == rhs.cwd &&
+            lhs.checkpointId == rhs.checkpointId && lhs.source == rhs.source &&
+            lhs.environment == rhs.environment && lhs.launchCommand == rhs.launchCommand &&
+            lhs.permissionMode == rhs.permissionMode && lhs.autoResume == rhs.autoResume &&
+            lhs.resumeEvidenceProvenance == rhs.resumeEvidenceProvenance &&
+            lhs.approvalPolicy == rhs.approvalPolicy && lhs.approvalRecordId == rhs.approvalRecordId &&
+            lhs.launchFlavor == rhs.launchFlavor && lhs.updatedAt == rhs.updatedAt
     }
 
     var isProcessDetected: Bool {

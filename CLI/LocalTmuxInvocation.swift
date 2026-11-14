@@ -23,6 +23,7 @@ struct LocalTmuxInvocation {
     let focus: Bool?
     let detached: Bool
     let newClient: Bool
+    let newWorkspace: Bool
     let headless: Bool
     let clientID: String?
     let all: Bool
@@ -71,6 +72,7 @@ struct LocalTmuxInvocation {
         var focus: Bool?
         var detached = false
         var newClient = false
+        var newWorkspace = false
         var headless = false
         var clientID: String?
         var all = false
@@ -136,6 +138,7 @@ struct LocalTmuxInvocation {
             case "--no-focus": focus = false
             case "--detached", "--no-attach": detached = true
             case "--new-client": newClient = true
+            case "--new-workspace": newWorkspace = true
             case "--headless": headless = true
             case "--client": clientID = try readValue(argument)
             case let value where value.hasPrefix("--client="): clientID = String(value.dropFirst("--client=".count))
@@ -190,7 +193,7 @@ struct LocalTmuxInvocation {
             throw CLIError(message: String(localized: "cli.localTmux.error.startOnly", defaultValue: "local-tmux --cwd and --command are only valid with start"))
         }
         if action != .start && action != .attach,
-           workspace != nil || surface != nil || pane != nil || window != nil || focus != nil || detached {
+           workspace != nil || surface != nil || pane != nil || window != nil || focus != nil || detached || newWorkspace {
             throw CLIError(message: String(
                 localized: "cli.localTmux.error.attachOrStartOnly",
                 defaultValue: "local-tmux workspace and attachment options are only valid with start or attach"
@@ -211,6 +214,12 @@ struct LocalTmuxInvocation {
         if newClient && action != .attach {
             throw CLIError(message: String(localized: "cli.localTmux.error.newClientOnly", defaultValue: "local-tmux --new-client is only valid with attach"))
         }
+        if newWorkspace && (workspace != nil || surface != nil || pane != nil || headless || detached || newClient) {
+            throw CLIError(message: String(
+                localized: "cli.localTmux.error.newWorkspaceConflict",
+                defaultValue: "local-tmux --new-workspace cannot be combined with --workspace, --surface, --pane, --headless, --detached, or --new-client"
+            ))
+        }
         return LocalTmuxInvocation(
             action: action,
             name: name,
@@ -224,6 +233,7 @@ struct LocalTmuxInvocation {
             focus: focus,
             detached: detached,
             newClient: newClient,
+            newWorkspace: newWorkspace,
             headless: headless,
             clientID: clientID,
             all: all,
@@ -239,7 +249,7 @@ struct LocalTmuxInvocation {
     Ordinary cmux terminals are unchanged.
 
     start <name> [--cwd <path>] [--command <shell>] [--detached]
-    attach <name|--id <uuid>> [--workspace <id|ref|index>] [--focus <true|false>] [--headless] [--new-client]
+    attach <name|--id <uuid>> [--workspace <id|ref|index>] [--focus <true|false>] [--headless] [--new-client] [--new-workspace]
     list [--json]
     status <name|--id <uuid>> [--json]
     detach <name|--id <uuid>> [--client <id> | --all]

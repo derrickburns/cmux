@@ -107,6 +107,7 @@ extension TerminalController {
                     title: execution.title,
                     workingDirectory: execution.workingDirectory,
                     initialTerminalCommand: execution.layoutNode == nil ? execution.initialCommand : nil,
+                    initialTerminalTmuxStartCommand: execution.initialTmuxStartCommand,
                     initialTerminalIsRemote: execution.layoutNode == nil && execution.initialTerminalIsRemote,
                     initialTerminalInput: initialTerminalInput,
                     initialTerminalEnvironment: execution.layoutNode == nil ? execution.initialEnvironment : [:],
