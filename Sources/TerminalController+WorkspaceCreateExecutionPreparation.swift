@@ -51,7 +51,7 @@ extension TerminalController {
         if v2HasNonNullParam(params, "tmux_start_command") {
             guard let requested = v2RawString(params, "tmux_start_command"),
                   requested == requestedInitialCommand,
-                  LocalSessionRestoreCommandPolicy.restorableCommand(requested) == requested,
+                  LocalSessionRestoreCommand(requested)?.command == requested,
                   !v2HasNonNullParam(params, "initial_input"),
                   !v2HasNonNullParam(params, "layout"),
                   !v2HasNonNullParam(params, "initial_terminal_is_remote") else {
