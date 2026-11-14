@@ -13,6 +13,9 @@ hook's refusal), a cancelled or timed-out job, and a failure with no test or
 error line to compare are never excused. Complete static-preflight diagnostics
 are also compared: their literal flag/path/date causes, never FAILED markers or
 number-masked summaries. Unknown or incomplete check bodies are refused.
+Dependency verdicts require the complete pinned workflow/program/needs context,
+and every failed leaf still passes the ordinary base comparison. Skipped or
+unreached checks remain unexecuted; attribution never reports them passing.
 One base red then no longer freezes
 every pull request into that base (2026-10-07: four base reds, and the PRs
 fixing them deadlocked on each other's reds).
@@ -26,7 +29,10 @@ steps and any test red before the crash are still compared.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -37,8 +43,8 @@ _spec.loader.exec_module(_evidence)
 GitHub, Refused, job_for, latest_checks = _evidence.GitHub, _evidence.Refused, _evidence.job_for, _evidence.latest_checks
 
 SETUP_STEPS = frozenset({"Set up job", "Set up runner"})
-# Jobs that only report the run's other jobs: judged by those jobs, never by themselves.
-AGGREGATES = frozenset({"ci-status"})
+# These names select a strict context reader, never an exemption from the audit.
+DEPENDENCY_JOBS = frozenset({"linux-preflight", "ci-status"})
 HOOK_REFUSAL = "glaeda-cmux-runner-hook: refused"
 VERDICTS = frozenset({"success", "failure"})
 TESTS = (
@@ -68,6 +74,26 @@ EXPIRED_FLAG = re.compile(
     r"^- ((?:(?:Sources|Packages|CLI|ios)/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.swift|"
     r"web/app/lib/feature-flags\.ts): '[a-z0-9]+(?:-[a-z0-9]+)*' reviewBy "
     r"\d{4}-\d\d-\d\d has passed — remove the zombie flag or consciously extend the date)$")
+CI_SOURCE = ".github/workflows/ci.yml"
+CI_SOURCE_SHA256 = "e13d007598ac5617fe87a327ef5273bf97df7b189bf937e7ab8d2631c204cb8d"
+CI_NEEDS = ("changes", "fast-guards", "claude-wrapper", "suite-coverage", "ui-tests",
+            "static-preflight", "guards", "ghosttykit-release-check", "browser", "remote-daemon",
+            "web", "linux-preflight", "macos-admission-gate", "macos")
+LINUX_NEEDS = ("changes", "static-preflight", "fast-guards", "guards", "ghosttykit-release-check", "web")
+CI_NAMES = {"fast-guards": "CI fast guards", "static-preflight": "Fast static checks",
+            "claude-wrapper": "Claude wrapper regressions", "ghosttykit-release-check": "GhosttyKit release check",
+            "macos-admission-gate": "macOS admission gate"}
+CI_CALLED = frozenset({"guards", "browser", "remote-daemon", "web", "macos"})
+CI_BOOLEAN_ROUTES = ("macos", "cli", "full_suite", "unit_suite", "swift_packages", "claude_wrapper",
+                     "linux_guard_tests", "linux_guard_history", "linux_guard_cli", "linux_guard_source",
+                     "web", "agent_session_web", "ghosttykit_release", "browser", "remote_daemon", "coverage_gap")
+CI_PROGRAMS = {
+    "linux-preflight": ("Check routed Linux results", "PREFLIGHT_NEEDS", 1447, 1534,
+                        "49f81e56acc38ce06ae7468c11abedbd6aa6e4fa5ab26176edcdab60dae137d0"),
+    "ci-status": ("Check platform workflow routing", "PLATFORM_NEEDS", 1749, 1828,
+                  "4e52775680a43a6eacfe0584229e78162fb58b5eb47c2cac0ab42ce91437784c"),
+}
+LOG_COLOR = re.compile(r"(?:\x1b|\^\[)\[[0-9;]*m")
 
 
 def lines_of(log: str) -> list[str]:
@@ -175,13 +201,237 @@ def refused_at_setup(job: dict, log: str | None = None) -> bool:
     return log is not None and HOOK_REFUSAL in log
 
 
+def unique_json(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise Refused("dependency context has a duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def dependency_run(repo: str, sha: str, run_id: int, github) -> dict:
+    """Read one closed CI source/initial-attempt context, without executing it.
+
+    A new workflow source or rerun needs its own reader. The source pin binds
+    the graph, display names, route predicates and program slices below.
+    """
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise Refused("dependency attribution needs an exact source SHA")
+    meta = github.json(f"repos/{repo}/actions/runs/{run_id}")
+    if (not isinstance(meta, dict) or meta.get("id") != run_id or meta.get("head_sha") != sha
+            or meta.get("path") != CI_SOURCE or meta.get("status") != "completed"
+            or meta.get("conclusion") != "failure" or meta.get("run_attempt") != 1
+            or type(meta.get("workflow_id")) is not int or meta["workflow_id"] <= 0
+            or not isinstance(meta.get("head_branch"), str) or not meta["head_branch"]
+            or not isinstance(meta.get("repository"), dict) or meta["repository"].get("full_name") != repo):
+        raise Refused("dependency attribution needs an exact completed source/run/workflow original attempt")
+    source = github.json(f"repos/{repo}/contents/{CI_SOURCE}?ref={sha}")
+    if (not isinstance(source, dict) or source.get("type") != "file" or source.get("path") != CI_SOURCE
+            or source.get("encoding") != "base64" or not isinstance(source.get("content"), str)):
+        raise Refused("dependency workflow source is unavailable")
+    raw = base64.b64decode(source["content"].replace("\n", ""), validate=True)
+    if (len(raw) != source.get("size") or hashlib.sha256(raw).hexdigest() != CI_SOURCE_SHA256
+            or hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest() != source.get("sha")):
+        raise Refused("dependency workflow source/graph is unknown or changed")
+    texts = raw.decode().splitlines()
+    programs = {}
+    for name, (_, _, first, last, digest) in CI_PROGRAMS.items():
+        program = "\n".join(line[10:] for line in texts[first - 1:last]).rstrip()
+        if hashlib.sha256(program.encode()).hexdigest() != digest:
+            raise Refused("dependency workflow program does not match its source")
+        programs[name] = program.splitlines()
+    changes = raw.decode().split("\n  changes:\n", 1)[1].split("\n  fast-guards:\n", 1)[0]
+    output_lines = changes.split("\n    outputs:\n", 1)[1].splitlines()
+    outputs = set()
+    for line in output_lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"      ([a-z][a-z0-9_]*):.*", line)
+        if match is None:
+            break
+        outputs.add(match[1])
+    pages = github.json(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100", paginate=True)
+    if (not isinstance(pages, list) or not pages or any(not isinstance(p, dict) for p in pages)
+            or any(type(p.get("total_count")) is not int or not isinstance(p.get("jobs"), list) for p in pages)
+            or len({p["total_count"] for p in pages}) != 1 or not 1 <= pages[0]["total_count"] <= 5000):
+        raise Refused("dependency run has no complete bounded job inventory")
+    jobs = [job for page in pages for job in page["jobs"]]
+    if len(jobs) != pages[0]["total_count"]:
+        raise Refused("dependency run job inventory is partial")
+    by_id, by_name = {}, {}
+    for job in jobs:
+        if (not isinstance(job, dict) or type(job.get("id")) is not int or job["id"] <= 0
+                or job["id"] in by_id or not isinstance(job.get("name"), str) or job["name"] in by_name
+                or job.get("run_id") != run_id or job.get("head_sha") != sha or job.get("status") != "completed"):
+            raise Refused("dependency run has duplicate, incomplete or foreign job identity")
+        by_id[job["id"]] = job
+        by_name[job["name"]] = job
+    return {"meta": meta, "jobs": jobs, "by_id": by_id, "by_name": by_name,
+            "programs": programs, "outputs": outputs, "rollups": {}}
+
+
+def dependency_group(context: dict, name: str, result: str) -> list[dict]:
+    display = CI_NAMES.get(name, name)
+    exact = [j for j in context["jobs"] if j["name"] == display]
+    called = [j for j in context["jobs"] if j["name"].startswith(name + " / ")]
+    if name not in CI_CALLED:
+        if len(exact) != 1 or called:
+            raise Refused(f"{name}: missing or ambiguous logical/display job binding")
+        jobs = exact
+    else:
+        if bool(exact) == bool(called) or len(exact) > 1:
+            raise Refused(f"{name}: missing or ambiguous called-workflow job binding")
+        jobs = exact or called
+    states = {j.get("conclusion") for j in jobs}
+    if result == "skipped":
+        if not exact or states != {"skipped"} or any(j.get("steps") != [] for j in jobs):
+            raise Refused(f"{name}: skipped work does not match its original job")
+    elif result == "success":
+        if "success" not in states or not states <= {"success", "skipped"}:
+            raise Refused(f"{name}: needs verdict differs from actual jobs")
+        for job in jobs:
+            if job["conclusion"] == "success" and (not job.get("steps") or any(
+                    step.get("status") != "completed" or step.get("conclusion") not in {"success", "skipped"}
+                    for step in job["steps"])):
+                raise Refused(f"{name}: successful dependency lacks completed step evidence")
+    elif result == "failure":
+        if "failure" not in states or not states <= {"success", "skipped", "failure"}:
+            raise Refused(f"{name}: failure has no corresponding failed original job")
+    else:
+        raise Refused(f"{name}: cancelled, unknown or unexecuted required verdict is not attribution")
+    return jobs
+
+
+def dependency_needs(context: dict, needs: dict, expected) -> None:
+    if not isinstance(needs, dict) or set(needs) != set(expected):
+        raise Refused("dependency needs graph is missing, extra or changed")
+    for name, data in needs.items():
+        if (not isinstance(data, dict) or set(data) != {"result", "outputs"}
+                or not isinstance(data["outputs"], dict) or (name != "changes" and data["outputs"])):
+            raise Refused("dependency needs record has an unknown shape")
+        dependency_group(context, name, data["result"])
+    out = needs["changes"]["outputs"]
+    if (needs["changes"]["result"] != "success" or not set(out) <= context["outputs"]
+            or any(not isinstance(v, str) for v in out.values())
+            or any(out.get(k) not in {"true", "false"} for k in CI_BOOLEAN_ROUTES)
+            or ("compile_admitted" in out and out["compile_admitted"] not in {"true", "false"})
+            or not re.fullmatch(r"[0-9a-f]{40}", out.get("source_parent1", ""))):
+        raise Refused("dependency routes or source projection are missing, unknown or changed")
+    meta = context["meta"]
+    fingerprint = (r"v1;sha=" + re.escape(meta["head_sha"]) + ";ref=" + re.escape(meta["head_branch"])
+                   + r";cache=(?:r2|github);release=(?:universal|arm64);coverage=(?:full|compile-only)")
+    if not re.fullmatch(fingerprint, out.get("coverage_fingerprint", "")):
+        raise Refused("dependency changes output belongs to a different source/ref")
+
+
+def dependency_step(context: dict, name: str, github, repo: str) -> tuple[dict, list[str]]:
+    job = context["by_name"].get(name)
+    step, variable, *_ = CI_PROGRAMS[name]
+    expected = ["Set up job", step, *(["Check routed CI jobs"] if name == "ci-status" else []), "Complete job"]
+    if (job is None or job.get("conclusion") != "failure"
+            or not isinstance(job.get("steps"), list) or [s.get("name") for s in job["steps"]] != expected
+            or any(s.get("status") != "completed" for s in job["steps"])
+            or [s.get("conclusion") for s in job["steps"]] !=
+               (["success", "failure", "skipped", "success"] if name == "ci-status" else ["success", "failure", "success"])):
+        raise Refused(f"{name}: failed-step or unexecuted-step ownership is unknown")
+    log = github.log(repo, job)
+    _, tests, errors = signature(job, log)
+    if tests or errors or crash_signals(log) or refused_at_setup(job, log):
+        raise Refused(f"{name}: independent error, test or runner fault is not a dependency refusal")
+    rows = []
+    for line in log.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 2)
+        if len(parts) != 3 or parts[0] != name:
+            raise Refused(f"{name}: log row has no exact job/step binding")
+        text = LOG_COLOR.sub("", STAMP.sub("", parts[2].lstrip("\ufeff"))).rstrip()
+        if parts[1] == step:
+            rows.append(text)
+        elif parts[1] not in {"Set up job", "Complete job"}:
+            raise Refused(f"{name}: an independent or skipped step has output")
+    program = context["programs"][name]
+    prefix = ["##[group]Run python3 - <<'PY'", *program, "shell: /usr/bin/bash -e {0}", "env:",
+              "  CI_CACHE_R2_PUBLIC_URL: https://ci-cache.cmux.com",
+              '  CI_OWNED_HEAD_REPOS: ["manaflow-ai/cmux", "teamleaderleo/cmux"]']
+    if rows[:len(prefix)] != prefix or len(rows) <= len(prefix) or not rows[len(prefix)].startswith("  " + variable + ": "):
+        raise Refused(f"{name}: complete program/environment source evidence is missing or changed")
+    rest = rows[len(prefix):]
+    if rest.count("##[endgroup]") != 1:
+        raise Refused(f"{name}: complete environment/body boundary is missing")
+    end = rest.index("##[endgroup]")
+    encoded = "\n".join([rest[0][len(variable) + 4:], *rest[1:end]])
+    needs = json.loads(encoded, object_pairs_hook=unique_json)
+    return needs, rest[end + 1:]
+
+
+def dependency_rollup(context: dict, name: str, github, repo: str) -> dict:
+    if name in context["rollups"]:
+        return context["rollups"][name]
+    needs, body = dependency_step(context, name, github, repo)
+    dependency_needs(context, needs, LINUX_NEEDS if name == "linux-preflight" else CI_NEEDS)
+    out = needs["changes"]["outputs"]
+    failed = []
+    if name == "linux-preflight":
+        if out["macos"] != "true":
+            raise Refused("linux-preflight ran outside its supported route")
+        diagnostics = []
+        for key in ("static-preflight", "fast-guards"):
+            state = needs[key]["result"]
+            if state not in {"success", "failure"}:
+                raise Refused(f"{key}: unexecuted required work has no inherited failed leaf")
+            if state == "failure":
+                failed.append(key)
+                diagnostics.append(f"{key}: failure")
+        for key, routed, suffix in (
+                ("guards", any(out[k] == "true" for k in ("linux_guard_tests", "linux_guard_history", "linux_guard_cli", "linux_guard_source")), "one or more guard routes=true"),
+                ("web", out["web"] == "true" or out["agent_session_web"] == "true", "one or more web routes=true"),
+                ("ghosttykit-release-check", out["ghosttykit_release"] == "true", "route ghosttykit_release=true")):
+            state = needs[key]["result"]
+            if (routed and state not in {"success", "failure"}) or (not routed and state not in {"success", "skipped"}):
+                raise Refused(f"{key}: independent routing fault or unexecuted required work")
+            if state == "failure":
+                failed.append(key)
+                diagnostics.append(f"{key}: failure ({suffix})")
+    else:
+        linux = dependency_rollup(context, "linux-preflight", github, repo)
+        if any(needs[k] != linux["needs"][k] for k in LINUX_NEEDS):
+            raise Refused("ci-status and linux-preflight disagree about the same original needs")
+        if (out["macos"] != "true" or needs["linux-preflight"]["result"] != "failure"
+                or needs["static-preflight"]["result"] != "failure"):
+            raise Refused("ci-status has no supported early failed-static predecessor")
+        # These jobs have an explicit successful-static predicate in this exact
+        # source. Their absence is attributable blocking, never a passing test.
+        for key in ("macos", "macos-admission-gate", "claude-wrapper", "remote-daemon", "ui-tests"):
+            if needs[key]["result"] != "skipped":
+                raise Refused(f"{key}: independent downstream route/result is not the supported block")
+        if out["coverage_gap"] != "false" or needs["suite-coverage"]["result"] != "skipped":
+            raise Refused("ci-status has an independent suite coverage fault")
+        if needs["browser"]["result"] != ("success" if out["browser"] == "true" else "skipped"):
+            raise Refused("ci-status has an independent browser routing fault")
+        diagnostics = ["linux preflight did not pass: failure"]
+        failed = ["linux-preflight"]
+    if not failed or body != [*diagnostics, "##[error]Process completed with exit code 1."]:
+        raise Refused(f"{name}: dependency diagnostics are partial, extra, unknown or changed")
+    leaves = set()
+    for key in failed:
+        if key in DEPENDENCY_JOBS:
+            leaves.update(dependency_rollup(context, key, github, repo)["leaves"])
+        else:
+            leaves.update(j["id"] for j in dependency_group(context, key, "failure") if j["conclusion"] == "failure")
+    if not leaves:
+        raise Refused(f"{name}: no actual failed leaf closes this dependency refusal")
+    result = {"needs": needs, "failed": set(failed), "leaves": leaves}
+    context["rollups"][name] = result
+    return result
+
+
 def head_jobs(repo: str, sha: str, runs: list[int], checks: list[str], github) -> list[dict]:
     jobs: dict[int, dict] = {}
     for run in runs:
         for page in github.json(f"repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100", paginate=True):
             for job in page.get("jobs") or []:
-                if job.get("name") in AGGREGATES:
-                    continue
                 if job.get("status") == "completed" and job.get("conclusion") not in ("success", "skipped", "neutral"):
                     if job.get("head_sha") not in (None, sha):
                         raise Refused(f"{job.get('name')}: job is not for the exact SHA {sha}")
@@ -193,10 +443,11 @@ def head_jobs(repo: str, sha: str, runs: list[int], checks: list[str], github) -
             if name not in latest:
                 raise Refused(f"{name}: has not run on exact head {sha}")
             job = job_for(repo, latest[name], sha, github)
-            if name in AGGREGATES:
+            if job.get("id") != int(latest[name]["details_url"].rsplit("/", 1)[1]):
+                raise Refused(f"{name}: job response is not the original required-check identity")
+            jobs[job["id"]] = job
+            if name in DEPENDENCY_JOBS:
                 aggregate_runs.append(job["run_id"])
-            else:
-                jobs[job["id"]] = job
         for run in aggregate_runs:
             found = head_jobs(repo, sha, [run], [], github)
             if not found:
@@ -214,6 +465,16 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
     if not jobs:
         # A red run or check with no failed job to show has nothing the base can excuse.
         raise Refused("no failed job found on the head to compare with the base")
+    contexts = {}
+    deferred = []
+    audited = set()
+    for job in jobs:
+        if job.get("name") in DEPENDENCY_JOBS and job["run_id"] not in contexts:
+            context = dependency_run(repo, sha, job["run_id"], github)
+            # Both owners must be explained, including ci-status's independent
+            # routing logic; a direct --run is not a weaker entry point.
+            dependency_rollup(context, "ci-status", github, repo)
+            contexts[job["run_id"]] = context
     for job in jobs:
         name = job.get("name", "")
         if job.get("conclusion") != "failure":
@@ -223,7 +484,8 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
         head_log = github.log(repo, job)
         if refused_at_setup(job, head_log):
             raise Refused(f"'{name}' was refused at setup by its runner; it gets re-run, never excused")
-        workflow = github.json(f"repos/{repo}/actions/runs/{job['run_id']}").get("workflow_id")
+        workflow = (contexts[job["run_id"]]["meta"]["workflow_id"] if job["run_id"] in contexts
+                    else github.json(f"repos/{repo}/actions/runs/{job['run_id']}").get("workflow_id"))
         if workflow not in base_runs:
             listed = github.json(f"repos/{repo}/actions/workflows/{workflow}/runs?branch={base}&status=completed&per_page=20")
             base_runs[workflow] = [run for run in listed.get("workflow_runs") or []
@@ -245,6 +507,27 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
         if base_job.get("conclusion") != "failure":
             raise Refused(f"'{name}' is not red on {base} run {base_run['id']} ({base_job.get('conclusion')}); "
                           "fix it on this head")
+        if name in DEPENDENCY_JOBS:
+            head_context = contexts[job["run_id"]]
+            if head_context["by_id"].get(job["id"]) != job:
+                raise Refused(f"{name}: original job changed during dependency collection")
+            if base_run["id"] not in contexts:
+                context = dependency_run(repo, base_run.get("head_sha"), base_run["id"], github)
+                if (context["meta"]["workflow_id"] != workflow or context["meta"]["head_branch"] != base
+                        or base_run.get("workflow_id") != workflow):
+                    raise Refused(f"{name}: base source/workflow/branch differs")
+                dependency_rollup(context, "ci-status", github, repo)
+                contexts[base_run["id"]] = context
+            base_context = contexts[base_run["id"]]
+            if base_context["by_id"].get(base_job["id"]) != base_job:
+                raise Refused(f"{name}: base job changed during dependency collection")
+            head_rollup = dependency_rollup(head_context, name, github, repo)
+            base_rollup = dependency_rollup(base_context, name, github, repo)
+            if (head_rollup["failed"] - base_rollup["failed"]
+                    or head_rollup["needs"]["changes"]["outputs"]["source_parent1"] != base_context["meta"]["head_sha"]):
+                raise Refused(f"{name}: dependency/source cause is not on the compared base original")
+            deferred.append((job, base_run, head_rollup))
+            continue
         head_steps, head_tests, head_errors = signature(job, head_log)
         head_crash = crash_signals(head_log)
         head_causes = static_causes(job, head_log)
@@ -274,6 +557,20 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
         what = "; ".join(crash + sorted(head_tests) + sorted(head_causes)) or "; ".join(sorted(head_errors))
         url = base_run.get("html_url") or f"https://github.com/{repo}/actions/runs/{base_run['id']}"
         audit.append(f"excused '{name}': {base} run {base_run['id']} fails the same way ({url}): {what[:400]}")
+        audited.add(job["id"])
+    for job, base_run, rollup in deferred:
+        if not rollup["leaves"] <= audited:
+            raise Refused(f"{job['name']}: not every failed dependency closed through the ordinary base leaf audit")
+        skipped = sorted(k for k, v in rollup["needs"].items() if v["result"] == "skipped")
+        audit.append(f"attributed '{job['name']}': exact dependency refusal on {base} run {base_run['id']}; "
+                     f"failed leaves independently audited; skipped work unexecuted: {', '.join(skipped) or 'none'}; "
+                     + ("later platform assertions and Check routed CI jobs unexecuted" if job["name"] == "ci-status"
+                        else "no skipped work is called passing"))
+    for run_id, context in contexts.items():
+        current = github.json(f"repos/{repo}/actions/runs/{run_id}")
+        keys = ("id", "head_sha", "head_branch", "workflow_id", "path", "run_attempt", "status", "conclusion")
+        if not isinstance(current, dict) or any(current.get(k) != context["meta"].get(k) for k in keys):
+            raise Refused("dependency run/attempt changed during the original audit")
     return audit
 
 
