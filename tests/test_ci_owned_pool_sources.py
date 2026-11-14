@@ -19,6 +19,9 @@ change in the commit that moves a feat-cmux-next-only workflow off the minis,
 and a stale entry is harmless). The other branch is read with `git show`; under GitHub Actions the
 test fetches it (one shallow, blob-less fetch, then the files it reads) and
 fails if it still cannot read it. Off CI a missing ref only skips that branch.
+An organization checkout keeps that origin route. A verified personal fork
+instead reads an exact official counterpart under an upstream-named Git ref;
+only bounded workflow and detector-input blobs are hydrated, never executed.
 
 Which branch the tree is: CMUX_OWNED_POOL_BRANCH when set; under Actions the
 branch the event targets (GITHUB_BASE_REF for a pull request, else
@@ -33,6 +36,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,8 +59,9 @@ BRANCHES = {"main": "origin/main", FEAT: "origin/feat-cmux-next"}
 ON_CI = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
-def git(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(ROOT), *args], input=stdin, capture_output=True, text=True)
+def git(*args: str, stdin: str | None = None, no_lazy: bool = False) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"} if no_lazy else None
+    return subprocess.run(["git", "-C", str(ROOT), *args], input=stdin, capture_output=True, text=True, env=env)
 
 
 def branch() -> str | None:
@@ -108,6 +113,191 @@ def fetch(ref: str) -> None:
             "origin", stdin="\n".join(blobs) + "\n")
 
 
+UPSTREAM = "manaflow-ai/cmux"
+UPSTREAM_ID = 1144115288
+UPSTREAM_URL = f"https://github.com/{UPSTREAM}.git"
+COMPARISON_MAX_FILES = 1024
+COMPARISON_MAX_BYTES = 16 * 1024 * 1024
+COMPARISON_MAX_FILE_BYTES = 1024 * 1024
+API_MAX_BYTES = 2 * 1024 * 1024
+OID = re.compile(r"[0-9a-f]{40}")
+
+
+class ComparisonSourceError(RuntimeError):
+    def __init__(self, message: str):
+        super().__init__("comparison source: " + message)
+
+
+def comparison_api(path: str):
+    """Bounded public source metadata, using the existing read token when supplied."""
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request("https://api.github.com/repos/" + path, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read(API_MAX_BYTES + 1)
+        if len(raw) > API_MAX_BYTES:
+            raise ComparisonSourceError("metadata response exceeds its byte budget")
+        return json.loads(raw)
+    except (OSError, ValueError) as error:
+        raise ComparisonSourceError("public source metadata is unavailable or malformed") from error
+
+
+def comparison_git(*args: str, stdin: str | None = None) -> str:
+    try:
+        result = git(*args, stdin=stdin, no_lazy=True)
+    except (OSError, UnicodeError) as error:
+        raise ComparisonSourceError("Git source is unavailable or not UTF-8") from error
+    if result.returncode:
+        raise ComparisonSourceError("Git source read/fetch failed: " + " ".join(result.stderr.split())[-300:])
+    return result.stdout
+
+
+def comparison_path(path: str) -> bool:
+    parent, _, name = path.rpartition("/")
+    return parent == sources.WORKFLOWS_DIR and name.endswith((".yml", ".yaml")) \
+        or parent == "scripts/ci" and name.endswith(".py")
+
+
+def comparison_inventory(sha: str) -> dict[str, tuple[str, int]]:
+    files = {}
+    for directory in (sources.WORKFLOWS_DIR, "scripts/ci"):
+        rows = comparison_api(f"{UPSTREAM}/contents/{directory}?ref={sha}")
+        # GitHub's directory endpoint is limited to 1,000 entries. Do not
+        # mistake a potentially capped response for a complete source list.
+        if not isinstance(rows, list) or len(rows) >= 1000:
+            raise ComparisonSourceError("source directory is unavailable or exceeds the entry budget")
+        seen = set()
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                raise ComparisonSourceError("invalid source directory entry")
+            path = row["path"]
+            if not comparison_path(path):
+                continue
+            name = path.rsplit("/", 1)[-1]
+            if path != directory + "/" + name or row.get("name") != name \
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or path in seen:
+                raise ComparisonSourceError("source path is conflicting or unsupported")
+            seen.add(path)
+            oid, size = row.get("sha"), row.get("size")
+            if row.get("type") != "file" or row.get("target") or row.get("submodule_git_url") \
+                    or not isinstance(oid, str) or not OID.fullmatch(oid) \
+                    or type(size) is not int or not 0 <= size <= COMPARISON_MAX_FILE_BYTES:
+                raise ComparisonSourceError("source file metadata exceeds its supported boundary")
+            files[path] = (oid, size)
+    required = {sources.POOL_SCRIPT, sources.POLICY_SCRIPT, sources.RESCUE_SCRIPT}
+    if not required <= files.keys() or not any(path.startswith(sources.WORKFLOWS_DIR + "/") for path in files):
+        raise ComparisonSourceError("required workflow/policy source is missing")
+    objects = {}
+    for oid, size in files.values():
+        if oid in objects and objects[oid] != size:
+            raise ComparisonSourceError("one source object has conflicting sizes")
+        objects[oid] = size
+    if len(files) > COMPARISON_MAX_FILES or sum(objects.values()) > COMPARISON_MAX_BYTES:
+        raise ComparisonSourceError("required CI source exceeds its hydration budget")
+    return files
+
+
+def hydrate_comparison(files: dict[str, tuple[str, int]]) -> None:
+    oids = sorted({oid for oid, _ in files.values()})
+    if not oids:
+        return
+    comparison_git("-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head",
+                   "--filter=blob:none", "--stdin", UPSTREAM_URL, stdin="\n".join(oids) + "\n")
+    actual = comparison_git("cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+                            stdin="\n".join(oids) + "\n").splitlines()
+    expected = {f"{oid} blob {size}" for oid, size in files.values()}
+    if len(actual) != len(oids) or set(actual) != expected:
+        raise ComparisonSourceError("hydrated source bytes do not match their declared objects/sizes")
+
+
+def comparison_bytes(files: dict[str, tuple[str, int]]) -> int:
+    return sum({oid: size for oid, size in files.values()}.values())
+
+
+def ci_comparison_ref(ref: str) -> tuple[str, str | None]:
+    """Keep organization/origin behavior; a personal fork reads a pinned official counterpart."""
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository):
+        raise ComparisonSourceError("repository context is missing or invalid")
+    if repository.split("/", 1)[0].lower() == "manaflow-ai":
+        return ref, None
+    name = next((name for name, known in BRANCHES.items() if known == ref), None)
+    if name is None:
+        raise ComparisonSourceError("unknown counterpart branch")
+    origin = comparison_git("remote", "get-url", "origin").strip()
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+                         r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", origin)
+    if not match or match[1].lower() != repository.lower():
+        raise ComparisonSourceError("origin does not match the repository context")
+    metadata = comparison_api(repository)
+    if not isinstance(metadata, dict):
+        raise ComparisonSourceError("invalid repository metadata")
+    parent, owner = metadata.get("parent"), metadata.get("owner")
+    full_name = metadata.get("full_name")
+    if type(metadata.get("id")) is not int or metadata["id"] <= 0 \
+            or str(metadata["id"]) != os.environ.get("GITHUB_REPOSITORY_ID") \
+            or not isinstance(full_name, str) or full_name.lower() != repository.lower() \
+            or metadata.get("fork") is not True \
+            or not isinstance(owner, dict) or owner.get("type") != "User" \
+            or not isinstance(owner.get("login"), str) \
+            or owner["login"].lower() != repository.split("/", 1)[0].lower() \
+            or not isinstance(parent, dict) or type(parent.get("id")) is not int \
+            or parent["id"] != UPSTREAM_ID or parent.get("full_name") != UPSTREAM:
+        raise ComparisonSourceError("repository is not the declared personal fork of the official parent")
+    branch = comparison_api(f"{UPSTREAM}/git/ref/heads/{name}")
+    obj = branch.get("object") if isinstance(branch, dict) else None
+    if not isinstance(obj, dict) or branch.get("ref") != f"refs/heads/{name}" \
+            or obj.get("type") != "commit" or not isinstance(obj.get("sha"), str) or not OID.fullmatch(obj["sha"]):
+        raise ComparisonSourceError("official branch/ref/commit identity differs")
+    sha = obj["sha"]
+    files = comparison_inventory(sha)
+    namespace = f"refs/cmux-ci/upstream/{UPSTREAM}/{name}/{sha}"
+    print("owned pool comparison: " + json.dumps({"phase": "planned_before_fetch", "repository": repository,
+          "repository_id": metadata["id"], "parent": UPSTREAM, "parent_id": UPSTREAM_ID,
+          "branch": name, "sha": sha, "namespace": namespace, "candidate_files": len(files),
+          "candidate_bytes": comparison_bytes(files)}),
+          file=sys.stderr)
+    cached = git("rev-parse", "--verify", "--quiet", namespace, no_lazy=True)
+    if cached.returncode == 0 and cached.stdout.strip() != sha:
+        raise ComparisonSourceError("cached official namespace has a different commit")
+    if cached.returncode:
+        comparison_git("fetch", "--no-tags", "--no-write-fetch-head", "--depth=1", "--filter=blob:none",
+                       UPSTREAM_URL, f"{sha}:{namespace}")
+    if comparison_git("rev-parse", f"{namespace}^{{commit}}").strip() != sha:
+        raise ComparisonSourceError("fetched comparison commit differs from the selected source")
+    listed = {}
+    for row in comparison_git("ls-tree", "-z", sha, sources.WORKFLOWS_DIR + "/", "scripts/ci/").split("\0"):
+        if not row:
+            continue
+        header, path = row.split("\t", 1)
+        mode, kind, oid = header.split()
+        if comparison_path(path):
+            if mode not in ("100644", "100755") or kind != "blob":
+                raise ComparisonSourceError("comparison includes a nonregular source file")
+            listed[path] = oid
+    if listed != {path: oid for path, (oid, _) in files.items()}:
+        raise ComparisonSourceError("Git tree and pre-fetch source inventory differ")
+    workflows = {path: row for path, row in files.items() if path.startswith(sources.WORKFLOWS_DIR + "/")}
+    hydrate_comparison(workflows)
+    reads = {sources.POOL_SCRIPT, sources.POLICY_SCRIPT, sources.RESCUE_SCRIPT}
+    for path in workflows:
+        reads.update(sources.SCRIPT_PATH.findall(comparison_git("show", f"{sha}:{path}")))
+    # Absent script references retain the Tree reader's ordinary None. The
+    # complete direct CI tree above proves absence; do not synthesize a file.
+    scripts = {path: files[path] for path in reads if path in files and path not in workflows}
+    hydrate_comparison(scripts)
+    if comparison_git("rev-parse", f"{namespace}^{{commit}}").strip() != sha:
+        raise ComparisonSourceError("official namespace changed before adoption")
+    print("owned pool comparison: " + json.dumps({"phase": "verified", "namespace": namespace, "sha": sha,
+          "hydrated_files": len(workflows) + len(scripts),
+          "hydrated_bytes": comparison_bytes({**workflows, **scripts})}),
+          file=sys.stderr)
+    return namespace, sha
+
+
 class OwnedPoolSources(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -116,9 +306,14 @@ class OwnedPoolSources(unittest.TestCase):
             raise unittest.SkipTest("cannot tell whether this tree is main or feat-cmux-next (a ref is missing); "
                                     "set CMUX_OWNED_POOL_BRANCH")
         cls.ref = other_ref()
+        comparison_sha = None
+        if ON_CI:
+            cls.ref, comparison_sha = ci_comparison_ref(cls.ref)
         if not has_ref(cls.ref) and ON_CI:
             fetch(cls.ref)
-        cls.other = sources.Tree(ROOT, cls.ref) if has_ref(cls.ref) else None
+        # The namespace retains explicit owner provenance; immutable bytes
+        # remain pinned even if another process later moves that local ref.
+        cls.other = sources.Tree(ROOT, comparison_sha or cls.ref) if has_ref(cls.ref) else None
         here = sources.Tree(ROOT)
         cls.trees = [here] + ([cls.other] if cls.other is not None else [])
         rescue_tree = cls.rescue_tree = cls.other if on_feat() else here
@@ -411,7 +606,7 @@ class OwnedPoolSources(unittest.TestCase):
         if self.watched is None:
             self.skipTest("main's rescue is not readable here")
         self.assertIn(".github/workflows/cmux-next-base-autofix.yml", self.watched)
-        feat = sources.Tree(ROOT) if on_feat() else self.other if self.ref == "origin/feat-cmux-next" else None
+        feat = sources.Tree(ROOT) if on_feat() else self.other if self.branch == "main" else None
         if feat is None:
             self.skipTest("feat-cmux-next's workflows are not readable here")
         self.assertIn(".github/workflows/cmux-next-base-autofix.yml", self.owned[str(feat)])
@@ -550,6 +745,10 @@ class ComparisonSourceTests(unittest.TestCase):
         self.assertTrue(probe.ref.startswith("refs/cmux-ci/upstream/manaflow-ai/cmux/"), probe.ref)
         self.assertEqual(self.checked(self.work, "rev-parse", probe.ref), self.feat)
         self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
+        try:
+            probe("test_run_39638669325s_workflow_is_watched").test_run_39638669325s_workflow_is_watched()
+        except unittest.SkipTest as error:
+            self.fail(f"the ordinary counterpart assertion must execute for the new namespace: {error}")
         for path in ("Sources/NotAComparisonInput.swift", "scripts/ci/unrelated_comparison.py"):
             oid = self.checked(self.official, "rev-parse", f"{self.feat}:{path}")
             self.assertNotEqual(self.command(self.work, "cat-file", "-e", oid).returncode, 0, path)
