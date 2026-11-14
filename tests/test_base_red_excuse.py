@@ -433,6 +433,12 @@ class StructuredStaticPreflight(unittest.TestCase):
         with self.assertRaises(excuse.Refused):
             self.judge()
 
+    def test_matching_test_cannot_hide_an_additional_preflight_error(self):
+        self.gh.logs[1] = self.body(raw=True) + "\n" + ISSUE + "\n##[error]unknown additional cause"
+        self.gh.logs[2] = self.body() + "\n" + ISSUE
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
     def test_head_source_mismatch_is_not_excused(self):
         self.gh.jobs[1]["head_sha"] = "c" * 40
         with self.assertRaises(excuse.Refused):
