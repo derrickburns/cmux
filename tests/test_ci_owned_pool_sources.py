@@ -780,6 +780,18 @@ class ComparisonSourceTests(unittest.TestCase):
         self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
         self.assertEqual(self.requests, [])
 
+    def test_the_current_repository_token_is_not_required_for_public_upstream_metadata(self) -> None:
+        self.probe()
+        own = [request for request in self.requests
+               if request.full_url == "https://api.github.com/repos/derrickburns/cmux"]
+        upstream = [request for request in self.requests
+                    if request.full_url.startswith("https://api.github.com/repos/manaflow-ai/cmux/")]
+        self.assertEqual(len(own), 1)
+        self.assertEqual(own[0].get_header("Authorization"), "Bearer fixture-public-read-token")
+        self.assertTrue(upstream)
+        for request in upstream:
+            self.assertIsNone(request.get_header("Authorization"), request.full_url)
+
     def test_wrong_repository_parent_and_ref_are_refused_before_fetch(self) -> None:
         valid = {"id": 1456369951, "full_name": "derrickburns/cmux", "fork": True,
                  "owner": {"login": "derrickburns", "type": "User"},
