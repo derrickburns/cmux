@@ -298,5 +298,179 @@ class Script(unittest.TestCase):
         self.assertIn("--override cannot bypass god-file, l10n or concurrency lint", text)
 
 
+class StructuredStaticPreflight(unittest.TestCase):
+    """Sanitized complete bodies from base 43607456566 and head 43606270780.
+
+    The expired flags are public source diagnostics, not generic FAILED markers.
+    Keep their paths, flag identities and review dates literal when comparing.
+    """
+
+    JOB = "Fast static checks"
+    STEP = "Run the contributor static preflight"
+    PASSED = ("xcstrings", "localization", "localization-defaults", "project-tests", "project",
+              "config-schema", "test-wiring-sync", "wire-app-sources", "ui-lab", "ui-fuzzer",
+              "launch-policy", "test-wiring", "package-groups", "remote-tmux-waits-tests", "remote-tmux-waits")
+    CAUSES = (
+        "Packages/Shared/CmuxClientConfig/Sources/CmuxClientConfig/ClientConfigFlag.swift: "
+        "'ios-feed-performance-release' reviewBy 2026-11-06 has passed — "
+        "remove the zombie flag or consciously extend the date",
+        "Sources/FeatureFlags.swift: 'agent-inbox-quick-view-enabled-release' reviewBy 2026-10-15 "
+        "has passed — remove the zombie flag or consciously extend the date",
+        "Sources/FeatureFlags.swift: 'conversation-sidebar-release' reviewBy 2026-10-18 "
+        "has passed — remove the zombie flag or consciously extend the date",
+    )
+
+    def body(self, causes=None, *, duration="2.08", raw=False):
+        lines = [f"PASSED {name} (0.12s)" for name in self.PASSED]
+        lines += [f"FAILED feature-flags ({duration}s)", "lint-feature-flags: FAILED"]
+        lines += [f"  - {cause}" for cause in (self.CAUSES if causes is None else causes)]
+        lines += ["Rerun from this checkout: python3 scripts/verify-local.py --only feature-flags",
+                  "FAILED: 16/16 selected checks ran. Native compilation, app tests and app launch were not checked.",
+                  "Next for Swift changes: use the normal native build/test workflow in CONTRIBUTING.md.",
+                  "##[error]Process completed with exit code 1."]
+        if raw:
+            return "\n".join(f"2026-11-14T14:43:05.1741148Z {line}" for line in lines)
+        return log(self.JOB, self.STEP, *lines)
+
+    def setUp(self):
+        self.gh = FakeGitHub()
+        self.gh.jobs = {1: failed_job(1, 10, HEAD, self.JOB, self.STEP),
+                        2: failed_job(2, 20, BASE_SHA, self.JOB, self.STEP)}
+        self.gh.base_runs[1]["workflow_id"] = 7
+        self.gh.logs = {1: self.body(raw=True), 2: self.body(duration="3.64")}
+
+    def judge(self):
+        return excuse.judge(REPO, "feat-cmux-next", HEAD, [10], self.gh)
+
+    def test_complete_retained_failure_bodies_match_across_both_log_formats(self):
+        audit = "\n".join(self.judge())
+        self.assertIn("run 20", audit)
+        self.assertIn("ios-feed-performance-release", audit)
+        self.assertIn("2026-11-06", audit)
+
+    def test_the_base_may_have_an_additional_complete_cause(self):
+        self.gh.logs[2] = self.body(self.CAUSES + (self.CAUSES[0].replace("ios-feed", "ios-other"),))
+        self.assertTrue(self.judge())
+
+    def test_runtime_durations_timestamps_and_passing_test_counts_are_not_causes(self):
+        self.gh.logs[1] = self.body(duration="9.99", raw=True).replace("PASSED project-tests (0.12s)",
+                                                                    "PASSED project-tests (1.10s; 15 tests executed, 1 skipped)")
+        self.assertTrue(self.judge())
+
+    def test_changed_flag_date_path_or_diagnostic_text_is_not_excused(self):
+        changes = (("ios-feed", "ios-other"), ("2026-11-06", "2026-11-07"),
+                   ("ClientConfigFlag.swift", "OtherFlag.swift"), ("has passed", "has changed"))
+        for before, after in changes:
+            with self.subTest(change=after):
+                self.gh.logs[1] = self.body(raw=True).replace(before, after)
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_a_new_head_cause_is_not_excused(self):
+        self.gh.logs[1] = self.body(self.CAUSES + (self.CAUSES[0].replace("ios-feed", "ios-new"),), raw=True)
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_missing_empty_or_unknown_cause_bodies_are_never_authority(self):
+        bodies = ((), ("unknown feature flag failure",), ("FAILED",))
+        for causes in bodies:
+            with self.subTest(causes=causes):
+                self.gh.logs = {1: self.body(causes, raw=True), 2: self.body(causes)}
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_truncation_or_missing_verifier_boundaries_refuses_even_on_both_runs(self):
+        for omitted in ("lint-feature-flags: FAILED", "Rerun from this checkout:", "FAILED: 16/16",
+                        "Next for Swift changes:", "##[error]Process completed"):
+            with self.subTest(omitted=omitted):
+                self.gh.logs = {1: "\n".join(line for line in self.body(raw=True).splitlines() if omitted not in line),
+                                2: "\n".join(line for line in self.body().splitlines() if omitted not in line)}
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_a_partial_or_inconsistent_execution_summary_refuses(self):
+        for summary in ("15/16", "17/17", "0/0"):
+            with self.subTest(summary=summary):
+                self.gh.logs = {1: self.body(raw=True).replace("16/16", summary),
+                                2: self.body().replace("16/16", summary)}
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_extra_unknown_failed_check_or_body_is_not_hidden_by_known_causes(self):
+        for extra in ("FAILED unknown-check (0.10s)", "unknown additional cause",
+                      "##[error]unknown additional cause"):
+            with self.subTest(extra=extra):
+                self.gh.logs[1] = self.body(raw=True).replace("Rerun from this checkout:", extra + "\nRerun from this checkout:")
+                self.gh.logs[2] = self.body().replace("Rerun from this checkout:", extra + "\nRerun from this checkout:")
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_duplicate_check_or_diagnostic_records_refuse(self):
+        for before, after in (("PASSED xcstrings (0.12s)", "PASSED localization (0.12s)"),
+                              (self.CAUSES[1], self.CAUSES[0])):
+            with self.subTest(before=before):
+                self.gh.logs = {1: self.body(raw=True).replace(before, after),
+                                2: self.body().replace(before, after)}
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_missing_base_body_does_not_become_generic_failed_step_authority(self):
+        self.gh.logs[2] = log(self.JOB, self.STEP, "FAILED feature-flags (3.64s)",
+                              "##[error]Process completed with exit code 1.")
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_new_error_or_test_beside_the_structured_body_still_refuses(self):
+        for extra in ("##[error]error: new compiler failure", OTHER):
+            with self.subTest(extra=extra):
+                self.gh.logs[1] = self.body(raw=True) + "\n" + extra
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_failing_test_cannot_hide_a_new_structured_cause(self):
+        self.gh.logs[1] = self.body(raw=True).replace("2026-11-06", "2026-11-07") + "\n" + ISSUE
+        self.gh.logs[2] = self.body() + "\n" + ISSUE
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_head_source_mismatch_is_not_excused(self):
+        self.gh.jobs[1]["head_sha"] = "c" * 40
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_base_source_mismatch_is_not_excused(self):
+        self.gh.jobs[2]["head_sha"] = "c" * 40
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_base_workflow_mismatch_is_not_excused(self):
+        self.gh.base_runs[1]["workflow_id"] = 8
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_base_branch_mismatch_is_not_excused(self):
+        self.gh.base_runs[1]["head_branch"] = "another-base"
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_job_or_failed_step_mismatch_is_not_excused(self):
+        for field in ("job", "step"):
+            with self.subTest(field=field):
+                self.setUp()
+                if field == "job":
+                    self.gh.jobs[2]["name"] = "Another static job"
+                else:
+                    self.gh.jobs[1]["steps"][-1]["name"] = "Another failed step"
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_tabbed_log_job_or_step_mismatch_is_not_excused(self):
+        for field in (self.JOB, self.STEP):
+            with self.subTest(field=field):
+                self.gh.logs[1] = self.body().replace(field, "another-owner")
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+
 if __name__ == "__main__":
     unittest.main()
