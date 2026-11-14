@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -321,6 +322,37 @@ class DecideTests(Case):
         delta.Git.run = refuse_fetch
         self.addCleanup(setattr, delta.Git, "run", original)
         self.assertIn("fatal: remote hung up", self.skip_reason({}))
+
+    def test_fallback_clears_a_filter_already_recorded_by_the_failed_attempt(self) -> None:
+        h1 = self.pr_head()
+        self.origin.commit("main", {"web/w.txt": "w1\n"})
+        self.origin.merge_main_into_pr()
+        merge, head = self.origin.tested_merge()
+        work = self.origin.checkout(merge)
+        trace = self.origin.root / "fallback-packets.log"
+        original = delta.Git.run
+        attempts = []
+
+        def fail_after_filter_registration(git_self, *args):
+            if args[0] == "fetch":
+                attempts.append(args)
+                if "--filter=tree:0" in args:
+                    # A failed partial fetch can leave its remote filter set.
+                    git(work, "config", "remote.origin.promisor", "true")
+                    git(work, "config", "remote.origin.partialclonefilter", "tree:0")
+                    raise subprocess.CalledProcessError(128, ["git", *args], stderr="controlled filtered-fetch failure")
+            return original(git_self, *args)
+
+        with patch.object(delta.Git, "run", fail_after_filter_registration), \
+                patch.dict(os.environ, {"GIT_TRACE_PACKET": str(trace)}):
+            decision = delta.decide(delta.Git(work), merge, head,
+                lambda oids: {oid: "success" for oid in oids if oid == h1})
+        self.assertTrue(any("--filter=tree:0" in args for args in attempts))
+        self.assertNotRegex(trace.read_text(), r"\bfilter tree:0\b",
+                            "The fallback must clear Git's stored filter, not inherit it")
+        self.assertEqual(decision.base, h1)
+        self.assertEqual(git(work, "show", f"{h1}:app/a.txt"), "a-pr")
+        self.assertEqual(git(work, "diff", "--name-only", h1, "HEAD"), "web/w.txt")
 
     def test_head_that_is_not_the_tested_merge_parent_does_not_apply(self) -> None:
         self.pr_head()

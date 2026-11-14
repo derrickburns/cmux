@@ -1160,6 +1160,7 @@ jobs:
       - name: Run the fast guard tests
         env:
           CMUX_GUARDS_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: scripts/ci/guards-local.sh --no-stamp --jobs 8
 
   # Report only. choose_ci_suite.py in `changes` already adds the suites

@@ -13,14 +13,19 @@ A hosted label reaches runs-on three ways, and this test reads all three:
 
 Allowed: the fork branch `github.repository_owner != 'manaflow-ai' && '<label>'` (it never evaluates in
 manaflow-ai; a Blacksmith label would queue forever in a personal fork), comments, and the exact lines in
-EXEMPT, each with the reason it cannot move. A `hosted_runner:` matrix row is not exempt: nothing proves
+EXEMPT, each with the reason it cannot move. Python returns behind the same proven owner inequality
+(or its pure, unshadowed zero-argument helper) are fork-only too. This admits individual literals,
+never an entire script or line. A `hosted_runner:` matrix row is not exempt: nothing proves
 every reader of it sits behind the fork branch, and no workflow has one today.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -81,6 +86,96 @@ def workflow_hits(root: Path) -> list[str]:
     return hits
 
 
+def python_fork_literals(source: str) -> set[tuple[int, int, int]]:
+    """Hosted constants behind the existing non-manaflow owner branch, fail closed.
+
+    This is a closed source grammar, not arbitrary Python data-flow inference.
+    Only guarded returns and direct comparison operands are admitted; else arms,
+    escaping functions, side-effect arguments and rebound helpers stay visible.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    owner_tests = {
+        ast.dump(ast.parse(f'{name}.split("/", 1)[0].casefold() != "manaflow-ai"', mode="eval").body)
+        for name in ("REPO", "repository")
+    }
+    definitions = [node for node in ast.walk(tree)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    rebound = {node.id for node in ast.walk(tree)
+               if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))}
+    rebound.update(node.arg for node in ast.walk(tree) if isinstance(node, ast.arg))
+    rebound.update(alias.asname or alias.name.split(".")[0]
+                   for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+                   for alias in node.names)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            rebound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            rebound.add(node.rest)
+    wildcard_import = any(isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+                          for node in ast.walk(tree))
+    helpers = set()
+    for node in tree.body:
+        if wildcard_import or not isinstance(node, ast.FunctionDef) or node.decorator_list or node.name in rebound:
+            continue
+        if sum(other.name == node.name for other in definitions) != 1:
+            continue
+        args = node.args
+        if args.posonlyargs or args.args or args.kwonlyargs or args.vararg or args.kwarg:
+            continue
+        body = node.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
+        if len(body) == 1 and isinstance(body[0], ast.Return) \
+                and ast.dump(body[0].value) in owner_tests:
+            helpers.add(node.name)
+
+    def fork_guard(node: ast.AST) -> bool:
+        if ast.dump(node) in owner_tests:
+            return True
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+            return any(fork_guard(value) for value in node.values)
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in helpers and not node.args and not node.keywords)
+
+    spans = set()
+
+    def admit(node: ast.AST) -> None:
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and HOSTED_MACOS.fullmatch(node.value) and node.lineno == node.end_lineno):
+            spans.add((node.lineno, node.col_offset, node.end_col_offset))
+
+    def scoped_nodes(node: ast.AST):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                             ast.Lambda, ast.GeneratorExp)):
+            return
+        yield node
+        for child in ast.iter_child_nodes(node):
+            yield from scoped_nodes(child)
+
+    def returns(node: ast.AST) -> None:
+        for value in scoped_nodes(node):
+            if isinstance(value, ast.Return) and value.value is not None:
+                for expression in scoped_nodes(value.value):
+                    admit(expression)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or not fork_guard(node.test):
+            continue
+        # A comparison reads a label; a call argument could act before the
+        # neighboring owner check, so it is deliberately not admitted here.
+        for comparison in scoped_nodes(node.test):
+            if isinstance(comparison, ast.Compare):
+                for operand in (comparison.left, *comparison.comparators):
+                    admit(operand)
+        for statement in node.body:
+            returns(statement)
+    return spans
+
+
 def script_hits(root: Path) -> list[str]:
     """Quoted hosted labels in scripts: a label a script returns or writes reaches runs-on via an output."""
     quoted = re.compile(r"""["'](macos-(?:latest|[0-9]+)(?:-(?:intel|large|xlarge|arm64))?)["']""")
@@ -98,11 +193,20 @@ def script_hits(root: Path) -> list[str]:
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
+            admitted = python_fork_literals(text) if path.suffix == ".py" else set()
             for number, line in enumerate(text.splitlines(), 1):
                 if line.lstrip().startswith("#"):
                     continue
-                if quoted.search(FORK_BRANCH.sub("", line)):
+                forks = [match.span() for match in FORK_BRANCH.finditer(line)]
+                for match in quoted.finditer(line):
+                    if any(start <= match.start() and match.end() <= end for start, end in forks):
+                        continue
+                    start, end = (len(line[:offset].encode("utf-8")) for offset in match.span())
+                    if any(row == number and left <= start and end <= right
+                           for row, left, right in admitted):
+                        continue
                     hits.append(f"{relative}:{number}:{line}")
+                    break
     return hits
 
 
@@ -138,6 +242,111 @@ class NoGitHubHostedMacos(unittest.TestCase):
                 self.assertFalse(HOSTED_MACOS.search(FORK_BRANCH.sub("", strip_comment(line))))
         # A matrix row is read like any other line: `runs-on: ${{ matrix.hosted_runner }}` would reach it.
         self.assertTrue(HOSTED_MACOS.search(FORK_BRANCH.sub("", strip_comment("          hosted_runner: macos-15"))))
+
+    def scan_python(self, source: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "scripts" / "any_route.py"
+            script.parent.mkdir()
+            script.write_text(textwrap.dedent(source), encoding="utf-8")
+            return script_hits(root)
+
+    def test_python_personal_owner_branches_are_supported(self):
+        for source in (
+            """
+            def pick(repository):
+                if repository.split("/", 1)[0].casefold() != "manaflow-ai":
+                    return "macos-26"
+                return "blacksmith-6vcpu-macos-26"
+            """,
+            """
+            def pick(repository, label):
+                if label == "macos-26" and repository.split("/", 1)[0].casefold() != "manaflow-ai":
+                    return "macos-26"
+                return None
+            """,
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.scan_python(source), [])
+
+    def test_python_pure_personal_owner_helper_is_supported(self):
+        self.assertEqual(self.scan_python('''
+            REPO = "manaflow-ai/cmux"
+            def hosted_fork():
+                """The same owner branch as the workflow."""
+                return REPO.split("/", 1)[0].casefold() != "manaflow-ai"
+            def pick():
+                if hosted_fork():
+                    return "macos-26"
+                return "blacksmith-6vcpu-macos-26"
+            def product(labels):
+                if hosted_fork():
+                    return "macos-26" if "macos-26" in labels else None
+                return None
+            def reuse(found):
+                if hosted_fork() and found.get("runner") != "macos-26":
+                    return None
+                return found
+        '''), [])
+
+    def test_python_upstream_and_unproven_routes_stay_rejected(self):
+        pure = '''
+            REPO = "manaflow-ai/cmux"
+            def hosted_fork():
+                return REPO.split("/", 1)[0].casefold() != "manaflow-ai"
+        '''
+        cases = [
+            'def pick():\n    return "macos-26"\n',
+            'def pick(repository):\n    if repository.split("/", 1)[0].casefold() == "manaflow-ai":\n        return "macos-26"\n',
+            'def pick(repository, ready):\n    if repository.split("/", 1)[0].casefold() != "manaflow-ai" or ready:\n        return "macos-26"\n',
+            'def pick(repository):\n    if repository.split("/", 1)[0].casefold() != "manaflow-ai":\n        return None\n    else:\n        return "macos-26"\n',
+            'def hosted_fork():\n    return True\ndef pick():\n    if hosted_fork():\n        return "macos-26"\n',
+            textwrap.dedent(pure) + 'hosted_fork = lambda: True\ndef pick():\n    if hosted_fork():\n        return "macos-26"\n',
+            textwrap.dedent(pure) + 'def pick(hosted_fork):\n    if hosted_fork():\n        return "macos-26"\n',
+            '@replace\ndef hosted_fork():\n    return REPO.split("/", 1)[0].casefold() != "manaflow-ai"\ndef pick():\n    if hosted_fork():\n        return "macos-26"\n',
+            'def pick(repository):\n    if repository.split("/", 1)[0].casefold() != "manaflow-ai":\n        def escaped():\n            return "macos-26"\n        return escaped\n',
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertTrue(self.scan_python(source))
+
+    def test_python_admission_is_per_literal_not_per_source_line(self):
+        # The first call executes before the owner comparison, including upstream.
+        # Its literal must not inherit the neighboring comparison/return's custody.
+        hits = self.scan_python('''
+            def pick(repository, label):
+                if emit("macos-26") and repository.split("/", 1)[0].casefold() != "manaflow-ai" and label == "macos-26":
+                    return "macos-26"
+                return None
+        ''')
+        self.assertEqual(len(hits), 1, hits)
+        self.assertIn('emit("macos-26")', hits[0])
+
+    def test_python_owner_branch_does_not_admit_deferred_callables(self):
+        for value in ('lambda: "macos-26"', '("macos-26" for _ in range(1))'):
+            with self.subTest(value=value):
+                self.assertTrue(self.scan_python(
+                    'def pick(repository):\n'
+                    '    if repository.split("/", 1)[0].casefold() != "manaflow-ai":\n'
+                    f'        return {value}\n'))
+
+    def test_python_helper_cannot_be_rebound_by_other_syntax(self):
+        prefix = ('REPO = "manaflow-ai/cmux"\n'
+                  'def hosted_fork():\n'
+                  '    return REPO.split("/", 1)[0].casefold() != "manaflow-ai"\n')
+        tail = ('def pick():\n'
+                '    if hosted_fork():\n'
+                '        return "macos-26"\n')
+        for binding in (
+            'class hosted_fork: pass\n',
+            'try: check()\nexcept Exception as hosted_fork: pass\n',
+            'match supplied:\n    case {"helper": hosted_fork}: pass\n',
+            'match supplied:\n    case [*hosted_fork]: pass\n',
+            'match supplied:\n    case {**hosted_fork}: pass\n',
+            'from another_route import *\n',
+        ):
+            with self.subTest(binding=binding):
+                self.assertTrue(self.scan_python(prefix + binding + tail))
 
     def test_no_workflow_selects_a_github_hosted_mac(self):
         left = unexempted(workflow_hits(ROOT))

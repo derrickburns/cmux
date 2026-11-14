@@ -5,8 +5,10 @@ import io
 import json
 import re
 import os
+import shutil
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -133,9 +135,10 @@ elif args[:2] == ["run", "list"]:
         print(os.environ.get("LAUNCHER_PRIOR_RUNS", "[]"))
         sys.exit(0)
     fields = json.loads((root / "dispatch.json").read_text())
+    repository = args[args.index("--repo") + 1]
     print(json.dumps([
-        {"databaseId": 999, "displayTitle": "someone else's newer run", "url": "https://github.com/manaflow-ai/cmux/actions/runs/999"},
-        {"databaseId": 123, "displayTitle": fields["test_filter"] + " on mac @ " + fields.get("ref", "main") + " [" + fields.get("dispatch_id", "") + "]", "url": "https://github.com/manaflow-ai/cmux/actions/runs/123"}
+        {"databaseId": 999, "displayTitle": "someone else's newer run", "url": f"https://github.com/{repository}/actions/runs/999"},
+        {"databaseId": 123, "displayTitle": fields["test_filter"] + " on mac @ " + fields.get("ref", "main") + " [" + fields.get("dispatch_id", "") + "]", "url": f"https://github.com/{repository}/actions/runs/123"}
     ]))
 elif args[:2] == ["run", "watch"]:
     sys.exit(int(os.environ.get("LAUNCHER_WATCH_STATUS", "0")))
@@ -257,7 +260,7 @@ class FocusedLauncherTests(unittest.TestCase):
                 self.assertEqual(self.dispatch()["ref"], HEAD)
 
     PR_CI = {"id": 500, "path": ".github/workflows/ci.yml", "event": "pull_request", "status": "completed",
-             "head_sha": HEAD, "created_at": "2026-09-25T00:00:00Z", "html_url": "https://x/runs/500",
+             "head_sha": HEAD, "created_at": "2026-09-25T00:00:00Z", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500",
              "head_repository": {"full_name": "manaflow-ai/cmux"},
              "referenced_workflows": [{"ref": "refs/pull/7/merge", "sha": MERGE}]}
     PRODUCTS = [{"id": 7, "name": "app-host-products-v1-k-1", "expired": False}]
@@ -446,6 +449,54 @@ class FocusedLauncherTests(unittest.TestCase):
         result = self.launch("cmuxTests/ExampleTests/testOne", "--ref", "topic/fix")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.dispatch()["ref"], REMOTE_HEAD)
+
+    def test_explicit_repository_owns_resolution_dispatch_discovery_and_watch(self):
+        repository = "derrickburns/cmux"
+        result = self.launch(
+            "cmuxTests/ExampleTests", "--repository", repository,
+            "--ref", "topic/fix", "--wait",
+            GH_REPO="unrelated/ambient",
+            CMUX_MACOS_RUNNER_TESTS=MINI,
+            LAUNCHER_VARIABLES=json.dumps([{"name": "MACOS_RUNNER_TESTS", "value": MINI}]),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.dispatch()["ref"], REMOTE_HEAD)
+        self.assertNotIn("runner", self.dispatch(), "the workflow owns the fork's hosted choice")
+        self.assertIn(f"https://github.com/{repository}/actions/runs/123", result.stdout)
+        calls = self.calls()
+        self.assertFalse(any(call[:2] == ["variable", "list"] for call in calls), calls)
+        for call in calls:
+            if call[:1] == ["api"]:
+                endpoint = call[-1]
+                self.assertTrue(endpoint.startswith(f"repos/{repository}/"), call)
+            if call[:2] in (["run", "list"], ["run", "watch"], ["workflow", "run"]):
+                self.assertEqual(call[call.index("--repo") + 1], repository, call)
+        self.assertIn(f"{repository}/123 --timeout 14400", (self.root / "glaeda.calls").read_text())
+
+    def test_invalid_repository_and_fork_provider_choices_refuse_before_github(self):
+        invalid = ["", "owner", "owner/repo/extra", "https://github.com/owner/repo",
+                   "owner/..", "../repo", "owner/repo?ref=main", "owner/repo\n", "-owner/repo"]
+        for repository in invalid:
+            with self.subTest(repository=repository):
+                result = self.launch("cmuxTests/ExampleTests", "--repository", repository)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls(), [])
+        result = self.launch("cmuxTests/ExampleTests", "--repository", "derrickburns/cmux",
+                             "--runner", MINI)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [])
+
+    def test_fork_history_rejects_foreign_receipts_and_reuses_the_owned_original(self):
+        foreign = json.loads(self._live(runner="macos-26"))[0]
+        owned = {**foreign, "url": "https://github.com/derrickburns/cmux/actions/runs/777"}
+        for history, reuses in [(foreign, False), (owned, True)]:
+            with self.subTest(reuses=reuses):
+                (self.root / "dispatch.json").unlink(missing_ok=True)
+                result = self.launch("cmuxTests/ExampleTests", "--repository", "derrickburns/cmux",
+                                     LAUNCHER_PRIOR_RUNS=json.dumps([history]))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("reusing" in result.stdout, reuses, result.stdout)
+                self.assertEqual((self.root / "dispatch.json").exists(), not reuses)
 
     def test_explicit_runner_reaches_the_workflow_dispatch(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/test-e2e.yml").read_text())
@@ -1182,6 +1233,178 @@ class FocusedLauncherTests(unittest.TestCase):
         self.assertEqual(len(guard_reads), 1, guard_reads)
 
 
+
+
+class FrameSparseConsumerTests(unittest.TestCase):
+    def test_each_workflow_frame_consumer_imports_from_its_declared_checkout(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/test-e2e.yml").read_text())
+        for job in ("build", "test"):
+            step = next(item for item in workflow["jobs"][job]["steps"]
+                        if item.get("name") == "Checkout the E2E test steps")
+            with self.subTest(job=job), tempfile.TemporaryDirectory() as directory:
+                checkout = Path(directory)
+                for relative in step["with"]["sparse-checkout"].split():
+                    source = ROOT / relative
+                    destination = checkout / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if source.is_dir():
+                        shutil.copytree(source, destination)
+                    else:
+                        shutil.copyfile(source, destination)
+                result = subprocess.run(
+                    [sys.executable, "-I", str(checkout / "scripts/ci/e2e-frames.py"), "--help"],
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--repo", result.stdout)
+
+
+class FrameOwnerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("repository_frames", ROOT / "scripts/ci/e2e-frames.py")
+        cls.frames = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.frames)
+
+    def test_run_url_retains_its_repository_and_scopes_default_output(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(sys, "argv", ["e2e-frames.py", "https://github.com/derrickburns/cmux/actions/runs/123", "--json"]), \
+                mock.patch.object(self.frames.tempfile, "gettempdir", return_value=directory), \
+                mock.patch.object(self.frames, "download", return_value=True) as download, \
+                mock.patch.object(self.frames, "load_built", return_value=[]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(self.frames.main(), 0)
+        run_id, repository, _, output = download.call_args.args
+        self.assertEqual((run_id, repository), ("123", "derrickburns/cmux"))
+        self.assertEqual(output, Path(directory) / "cmux-ui-frames/derrickburns/cmux/123")
+
+    def test_conflicting_run_url_or_invalid_repository_refuses_before_download(self):
+        for source, repository in [
+            ("https://github.com/manaflow-ai/cmux/actions/runs/123", "derrickburns/cmux"),
+            ("https://example.org/manaflow-ai/cmux/actions/runs/123", "manaflow-ai/cmux"),
+            ("123", "owner/../repo"),
+        ]:
+            with self.subTest(source=source, repository=repository), \
+                    mock.patch.object(sys, "argv", ["e2e-frames.py", source, "--repo", repository, "--json"]), \
+                    mock.patch.object(self.frames, "download", return_value=True) as download, \
+                    mock.patch.object(self.frames, "load_built", return_value=[]), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit):
+                    self.frames.main()
+                download.assert_not_called()
+
+    def test_marker_cannot_reuse_another_repository_or_run_original(self):
+        for repository, run_id in [("derrickburns/cmux", "123"), ("manaflow-ai/cmux", "124")]:
+            with self.subTest(repository=repository, run_id=run_id), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(self.frames.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                output = Path(directory) / "output"
+                self.assertTrue(self.frames.download("123", "manaflow-ai/cmux", "ui-frames", output))
+                with self.assertRaises(ValueError):
+                    self.frames.download(run_id, repository, "ui-frames", output)
+                self.assertEqual(run.call_count, 1)
+
+    def test_legacy_or_unowned_nonempty_output_is_not_adopted(self):
+        for filename in (".downloaded-ui-frames", "summary.json"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(self.frames.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                output = Path(directory)
+                original = output / filename
+                original.write_text("original unbound bytes")
+                with self.assertRaises(ValueError):
+                    self.frames.download("123", "derrickburns/cmux", "ui-frames", output)
+                run.assert_not_called()
+                self.assertEqual(original.read_text(), "original unbound bytes")
+
+    def test_owned_marker_reuses_only_the_exact_original_without_downloading_again(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.frames.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            output = Path(directory) / "output"
+            for _ in range(2):
+                self.assertTrue(self.frames.download("123", "derrickburns/cmux", "ui-frames", output))
+            self.assertEqual(run.call_count, 1)
+
+    def test_failed_download_does_not_admit_success(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.frames.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+            output = Path(directory) / "output"
+            self.assertFalse(self.frames.download("123", "derrickburns/cmux", "ui-frames", output))
+            self.assertFalse((output / ".downloaded-ui-frames").exists())
+
+
+class RepositoryOwnerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "repository_dispatch", ROOT / "scripts/ci/dispatch-focused-test.py"
+        )
+        cls.dispatch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.dispatch)
+
+    def test_fork_auto_ignores_organization_provider_configuration(self):
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.dict(os.environ, {"CMUX_MACOS_RUNNER_TESTS": MINI}), \
+                mock.patch.object(self.dispatch, "listed_variables", side_effect=AssertionError("queried variables")), \
+                mock.patch.object(self.dispatch.pool, "auto_runner", side_effect=AssertionError("queried organization pool")):
+            self.assertEqual(self.dispatch.default_runner(), "macos-26")
+            self.assertEqual(self.dispatch.routed_runner(MINI, "cmuxTests"), "macos-26")
+
+    def test_history_cannot_adopt_another_repositories_run(self):
+        foreign = {"databaseId": 123, "url": "https://github.com/manaflow-ai/cmux/actions/runs/123"}
+        owned = {**foreign, "url": "https://github.com/derrickburns/cmux/actions/runs/123"}
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"):
+            self.assertFalse(self.dispatch.watchable(foreign))
+            self.assertTrue(self.dispatch.watchable(owned))
+
+    def test_exact_dispatch_discovery_refuses_a_foreign_repository(self):
+        foreign = {"databaseId": 123, "displayTitle": "cmuxTests/Example on macos-26 @ " + HEAD + " [mine]",
+                   "url": "https://github.com/manaflow-ai/cmux/actions/runs/123"}
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch, "output", return_value=json.dumps([foreign])), \
+                mock.patch.object(self.dispatch, "wait_for_retry", return_value=False):
+            with self.assertRaisesRegex(ValueError, "before dispatching again"):
+                self.dispatch.find_run(HEAD, "cmuxTests/Example", "mine")
+
+    def test_product_wait_never_adopts_a_foreign_repository_producer(self):
+        foreign = {"id": 123, "path": ".github/workflows/ci.yml", "event": "push", "status": "in_progress",
+                   "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/123"}
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch.rerun, "gh_api", return_value={"workflow_runs": [foreign]}), \
+                mock.patch.object(self.dispatch.rerun, "built_revision", return_value=HEAD), \
+                mock.patch.object(self.dispatch.rerun, "non_test_changes", return_value=[]):
+            self.assertIsNone(self.dispatch.building_producer(HEAD))
+
+    def test_frame_result_owner_receives_the_selected_repository(self):
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch, "watch_run", return_value=0), \
+                mock.patch.object(self.dispatch.subprocess, "run") as run:
+            self.assertEqual(self.dispatch.watch_and_extract(123, True), 0)
+        command = run.call_args.args[0]
+        self.assertIn("--repo", command)
+        self.assertEqual(command[command.index("--repo") + 1], "derrickburns/cmux")
+
+    def test_rerun_dispatch_retains_the_product_source_repository(self):
+        source = {"source_run_id": "321", "source_sha": HEAD, "runner": "macos-26"}
+        receipt = {"databaseId": 123, "url": "https://github.com/derrickburns/cmux/actions/runs/123"}
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch, "fetch_selected_commit"), \
+                mock.patch.object(self.dispatch, "planned_products", return_value=source), \
+                mock.patch.object(self.dispatch, "find_run", return_value=receipt), \
+                mock.patch.object(self.dispatch.subprocess, "run") as run, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(self.dispatch.reuse_ci_products(HEAD, ["cmuxTests/ExampleTests"], None, False), 0)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--repo") + 1], "derrickburns/cmux")
+        self.assertIn("source_repository=derrickburns/cmux", command)
+
+    def test_fork_product_family_uses_only_its_hosted_producer(self):
+        with mock.patch.object(self.dispatch, "REPO", "derrickburns/cmux"), \
+                mock.patch.object(self.dispatch.rerun, "gh_api") as api, \
+                mock.patch.object(self.dispatch, "listed_variables", side_effect=AssertionError("queried provider variables")):
+            for label, expected in [("macos-26", "macos-26"), (MINI, None), (SMALL, None)]:
+                with self.subTest(label=label):
+                    api.return_value = {"jobs": [{"name": self.dispatch.rerun.ADMISSION_JOB, "labels": [label]}]}
+                    self.assertEqual(self.dispatch.product_family({"id": 123}), expected)
+                    self.assertIn("repos/derrickburns/cmux/actions/runs/123/", api.call_args.args[0])
 
 
 class RunDiscoveryTests(unittest.TestCase):
@@ -1929,7 +2152,7 @@ class CIProductReuseTests(unittest.TestCase):
         self.run_command = mock.patch.object(self.dispatch.subprocess, "run").start()
         self.addCleanup(mock.patch.stopall)
         self.find_run = mock.patch.object(
-            self.dispatch, "find_run", return_value={"databaseId": 9, "url": "https://x/runs/9"}
+            self.dispatch, "find_run", return_value={"databaseId": 9, "url": "https://github.com/manaflow-ai/cmux/actions/runs/9"}
         ).start()
         mock.patch.object(self.dispatch, "wait_for_retry", return_value=False).start()
 
@@ -1955,7 +2178,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_ci_still_compiling_the_commit_is_awaited_not_duplicated(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-              "event": "pull_request", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "pull_request", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         artifacts = iter([None, self.PRODUCTS])
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: (
@@ -1973,7 +2196,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_a_merge_that_moved_app_code_is_not_awaited(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-              "event": "pull_request", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "pull_request", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: {"workflow_runs": [ci]}
         with mock.patch.object(self.dispatch, "planned_products", return_value=None), \
@@ -1986,7 +2209,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_ci_that_finishes_without_products_falls_back_to_a_full_build(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "queued",
-              "event": "push", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "push", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: (
             {"workflow_runs": [ci]} if "head_sha=" in path else {"status": "completed"}
@@ -2000,7 +2223,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_ci_that_skips_its_macos_compile_is_not_awaited(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-              "event": "workflow_dispatch", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "workflow_dispatch", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: (
             {"workflow_runs": [ci]} if "head_sha=" in path
@@ -2023,7 +2246,7 @@ class CIProductReuseTests(unittest.TestCase):
         for conclusion in ("failure", "cancelled", "success"):
             with self.subTest(conclusion):
                 ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-                      "event": "workflow_dispatch", "html_url": "https://x/runs/500", "head_sha": HEAD}
+                      "event": "workflow_dispatch", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
                 rerun = self.dispatch.rerun
                 rerun.gh_api.side_effect = lambda path, ci=ci, conclusion=conclusion: (
                     {"workflow_runs": [ci]} if "head_sha=" in path
@@ -2041,7 +2264,7 @@ class CIProductReuseTests(unittest.TestCase):
 
     def test_ci_whose_compile_admission_is_still_running_is_awaited(self):
         ci = {"id": 500, "path": ".github/workflows/ci.yml", "status": "in_progress",
-              "event": "workflow_dispatch", "html_url": "https://x/runs/500", "head_sha": HEAD}
+              "event": "workflow_dispatch", "html_url": "https://github.com/manaflow-ai/cmux/actions/runs/500", "head_sha": HEAD}
         rerun = self.dispatch.rerun
         rerun.gh_api.side_effect = lambda path: (
             {"workflow_runs": [ci]} if "head_sha=" in path

@@ -233,6 +233,7 @@ exit 97
                 checkout['with']['sparse-checkout'].split(),
                 ['.github/actions/e2e-run-tests',
                  'scripts/ci/e2e-frames.py',
+                 'scripts/ci/app_host_test_rerun.py',
                  'scripts/ci/brew-ensure.sh'],
             )
             # Every entry has to exist, since sparse-checkout of a missing path

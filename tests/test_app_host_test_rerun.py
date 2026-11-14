@@ -133,6 +133,36 @@ class ProductLookupTests(unittest.TestCase):
         )
         self.assertIsNone(rerun.find_products("o/r", ["only"], api))
 
+    def test_foreign_product_receipt_is_refused_while_the_owned_original_qualifies(self) -> None:
+        artifact = {"id": 7, "name": "app-host-products-v1-abc-1", "expired": False}
+        for owner, accepted in [("foreign/repo", False), ("o/r", True)]:
+            with self.subTest(owner=owner):
+                api, calls = self.fake_api(
+                    {"head": [{"id": 1, "html_url": f"https://github.com/{owner}/actions/runs/1"}]},
+                    {"1": [artifact]},
+                )
+                found = rerun.find_products("o/r", ["head"], api)
+                self.assertEqual(found is not None, accepted)
+                self.assertEqual(any("/artifacts" in call for call in calls), accepted)
+
+    def test_missing_git_commit_is_fetched_from_the_explicit_repository(self) -> None:
+        with unittest.mock.patch.object(rerun.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)), \
+                unittest.mock.patch.object(rerun, "git") as git:
+            rerun.fetch_commit("a" * 40, repository="derrickburns/cmux")
+        git.assert_called_once_with("fetch", "--no-tags", "--quiet", "https://github.com/derrickburns/cmux.git", "a" * 40, cwd=None)
+
+    def test_invalid_repository_is_refused_before_git_or_github(self) -> None:
+        with unittest.mock.patch.object(rerun.subprocess, "run") as run, \
+                unittest.mock.patch.object(rerun, "git") as git:
+            with self.assertRaises(ValueError):
+                rerun.fetch_commit("a" * 40, repository="owner/../repo")
+        run.assert_not_called()
+        git.assert_not_called()
+
+    def test_hosted_fork_product_retains_its_actual_runner(self) -> None:
+        api = lambda path: {"jobs": [{"name": "build", "labels": ["macos-26"]}]}
+        self.assertEqual(rerun.product_runner("derrickburns/cmux", "1", api), "macos-26")
+
 
 
 class PullRequestProductTests(unittest.TestCase):
@@ -312,7 +342,7 @@ class ProductRunnerTests(unittest.TestCase):
 
     def test_github_hosted_admission_maps_to_the_same_macos(self) -> None:
         api = self.api_for([{"name": "macos / macOS compile admission", "labels": ["macos-26"]}])
-        self.assertEqual(rerun.product_runner("o/r", "5", api), "blacksmith-6vcpu-macos-26")
+        self.assertEqual(rerun.product_runner("manaflow-ai/cmux", "5", api), "blacksmith-6vcpu-macos-26")
 
     def test_owned_pool_admission_maps_to_the_lane_xcode_pool(self) -> None:
         # An owned Mac carries the pull-request lane's Xcode, the macOS 26 pools' pin.
