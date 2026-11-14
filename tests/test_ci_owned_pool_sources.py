@@ -442,13 +442,13 @@ class ComparisonSourceTests(unittest.TestCase):
         self.watched = (".github/workflows/common.yml", ".github/workflows/cmux-next-base-autofix.yml")
         self.put(self.official, sources.RESCUE_SCRIPT,
                  f"WATCHED_WORKFLOW_PATHS = {self.watched!r}\nUNRESCUED_WORKFLOW_PATHS = {{}}\n")
-        self.put(self.official, self.watched[0], "jobs:\n  test:\n    runs-on: glaeda-test\n")
+        self.put(self.official, self.watched[0], "on: push\njobs:\n  test:\n    runs-on: glaeda-test\n")
         self.checked(self.official, "add", ".")
         self.checked(self.official, "commit", "-q", "-m", "official main")
         self.main = self.checked(self.official, "rev-parse", "HEAD")
         self.checked(self.official, "checkout", "-q", "-b", FEAT)
         self.put(self.official, self.watched[1],
-                 "jobs:\n  test:\n    runs-on: glaeda-test\n    steps:\n"
+                 "on: push\njobs:\n  test:\n    runs-on: glaeda-test\n    steps:\n"
                  "      - run: python3 scripts/ci/comparison_picker.py\n")
         self.put(self.official, "scripts/ci/comparison_picker.py", "import pr_runner_pool\n")
         self.put(self.official, "scripts/ci/unrelated_comparison.py", "# not read by the detector\n")
@@ -493,7 +493,8 @@ class ComparisonSourceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
-    def transport(self, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    def transport(self, *args: str, stdin: str | None = None,
+                  no_lazy: bool = False) -> subprocess.CompletedProcess:
         self.calls.append(args)
         mapped = list(args)
         if "fetch" in args:
