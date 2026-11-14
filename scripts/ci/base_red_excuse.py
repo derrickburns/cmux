@@ -10,7 +10,10 @@ compile error, say), and warnings never are: they vary run to run (SwiftPM's
 cache warnings refused #18147 on 2026-10-07). Names are compared, not counts:
 the base may fail more. A runner refusal (no steps, a failed setup step, or the glaeda
 hook's refusal), a cancelled or timed-out job, and a failure with no test or
-error line to compare are never excused. One base red then no longer freezes
+error line to compare are never excused. Complete static-preflight diagnostics
+are also compared: their literal flag/path/date causes, never FAILED markers or
+number-masked summaries. Unknown or incomplete check bodies are refused.
+One base red then no longer freezes
 every pull request into that base (2026-10-07: four base reds, and the PRs
 fixing them deadlocked on each other's reds).
 
@@ -54,6 +57,17 @@ STAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ?")
 CRASH = re.compile(r"exited with unexpected signal code (\d+)|the test helper died on signal (\d+)")
 CRASH_LINE = re.compile(r"exited with unexpected signal code|the test helper died on signal|"
                         r"no \"Test run with\" summary line")
+STATIC_JOB = "Fast static checks"
+STATIC_STEP = "Run the contributor static preflight"
+CHECK_RESULT = re.compile(r"^(PASSED|FAILED) ([a-z][a-z0-9-]*) \(\d+(?:\.\d+)?s(?:; [^()]+)?\)$")
+PREFLIGHT_END = re.compile(r"^FAILED: ([1-9]\d*)/([1-9]\d*) selected checks ran\. "
+                           r"Native compilation, app tests and app launch were not checked\.$")
+# This is the complete public diagnostic emitted by lint-feature-flags.py for
+# an expired flag. Other failure kinds need their own complete-body parser.
+EXPIRED_FLAG = re.compile(
+    r"^- ((?:(?:Sources|Packages|CLI|ios)/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.swift|"
+    r"web/app/lib/feature-flags\.ts): '[a-z0-9]+(?:-[a-z0-9]+)*' reviewBy "
+    r"\d{4}-\d\d-\d\d has passed — remove the zombie flag or consciously extend the date)$")
 
 
 def lines_of(log: str) -> list[str]:
@@ -78,6 +92,75 @@ def signature(job: dict, log: str) -> tuple[set[str], set[str], set[str]]:
         if ERROR.search(text) and not GENERIC.search(text) and not WARNING.search(text) and not CRASH_LINE.search(text):
             errors.add(re.sub(r"\d+", "#", text.replace("##[error]", "").strip()))
     return steps, tests, errors
+
+
+def static_causes(job: dict, log: str) -> set[str]:
+    """Literal causes from a complete, source-stable contributor preflight.
+
+    Only the known expired-flag body is supported. A matching job/check name,
+    generic exit code, partial body or unknown failure is never attribution.
+    """
+    def marker(text: str) -> bool:
+        return text == "lint-feature-flags: FAILED" or text.startswith("FAILED feature-flags (")
+    if job.get("name") != STATIC_JOB:
+        if any(marker(text) for text in lines_of(log)):
+            raise Refused("static preflight diagnostic belongs to a different job")
+        return set()
+    steps, _, errors = signature(job, log)
+    if steps != {STATIC_STEP} or errors:
+        raise Refused("static preflight has an unknown failed-step binding or error body")
+    texts = []
+    for line in log.splitlines():
+        parts = line.split("\t", 2)
+        text = STAMP.sub("", parts[-1]).strip()
+        if len(parts) == 3 and (parts[0] != STATIC_JOB or parts[1] != STATIC_STEP):
+            if marker(text) or parts[1] == STATIC_STEP:
+                raise Refused("static preflight log has a different job or step binding")
+            continue
+        if text:
+            texts.append(text)
+    starts = [i for i, text in enumerate(texts) if CHECK_RESULT.fullmatch(text)]
+    ends = [(i, match) for i, text in enumerate(texts) if (match := PREFLIGHT_END.fullmatch(text))]
+    if not starts or len(ends) != 1:
+        raise Refused("static preflight has no complete check-body boundary")
+    end, summary = ends[0]
+    if (summary[1] != summary[2] or end + 2 >= len(texts)
+            or texts[end + 1] != "Next for Swift changes: use the normal native build/test workflow in CONTRIBUTING.md."
+            or texts[end + 2] != "##[error]Process completed with exit code 1."):
+        raise Refused("static preflight is partial or its completion boundary is unknown")
+    cursor = starts[0]
+    checks: set[str] = set()
+    causes: set[str] = set()
+    while cursor < end:
+        result = CHECK_RESULT.fullmatch(texts[cursor])
+        if result is None or result[2] in checks:
+            raise Refused("static preflight has an unknown or duplicate check body")
+        status, name = result[1], result[2]
+        checks.add(name)
+        cursor += 1
+        if status == "PASSED":
+            continue
+        if name != "feature-flags" or cursor >= end or texts[cursor] != "lint-feature-flags: FAILED":
+            raise Refused("static preflight has an unsupported failed-check body")
+        cursor += 1
+        count = 0
+        while cursor < end and texts[cursor].startswith("- "):
+            match = EXPIRED_FLAG.fullmatch(texts[cursor])
+            if match is None or "/../" in match[1] or "/./" in match[1]:
+                raise Refused("static preflight has an unknown feature-flag diagnostic")
+            cause = "feature-flags: " + match[1]
+            if cause in causes:
+                raise Refused("static preflight has a duplicate feature-flag diagnostic")
+            causes.add(cause)
+            count += 1
+            cursor += 1
+        if (not count or cursor >= end
+                or texts[cursor] != "Rerun from this checkout: python3 scripts/verify-local.py --only feature-flags"):
+            raise Refused("static preflight has an incomplete or unknown feature-flag body")
+        cursor += 1
+    if len(checks) != int(summary[1]) or not causes or any(i >= end for i in starts):
+        raise Refused("static preflight execution records do not match its complete summary")
+    return causes
 
 
 def crash_signals(log: str) -> set[str]:
@@ -164,21 +247,31 @@ def judge(repo: str, base: str, sha: str, runs: list[int], github, *, checks: li
                           "fix it on this head")
         head_steps, head_tests, head_errors = signature(job, head_log)
         head_crash = crash_signals(head_log)
-        if not head_tests and not head_errors and not head_crash:
+        head_causes = static_causes(job, head_log)
+        if not head_tests and not head_errors and not head_crash and not head_causes:
             raise Refused(f"'{name}': no failing test or error line to match; nothing to compare with the base")
         base_log = github.log(repo, base_job)
         base_steps, base_tests, base_errors = signature(base_job, base_log)
+        base_causes = static_causes(base_job, base_log)
+        if head_causes and (job.get("head_sha") != sha
+                            or base_run.get("head_branch") != base
+                            or base_run.get("workflow_id") != workflow
+                            or not re.fullmatch(r"[0-9a-f]{40}", base_run.get("head_sha") or "")
+                            or base_job.get("head_sha") != base_run["head_sha"]
+                            or base_job.get("run_id") != base_run["id"]):
+            raise Refused(f"'{name}': structured diagnostics have a different source, workflow or job binding")
         if missing := sorted(head_crash - crash_signals(base_log)):
             raise Refused(f"'{name}': the test helper died on signal {', '.join(missing)}, "
                           f"and {base} run {base_run['id']} did not")
         compared = [("failed steps", head_steps, base_steps), ("failing tests", head_tests, base_tests)]
-        if not head_tests:
+        compared.append(("static check causes", head_causes, base_causes))
+        if not head_tests or head_causes:
             compared.append(("errors", head_errors, base_errors))
         for kind, head, seen in compared:
             if missing := sorted(head - seen):
                 raise Refused(f"'{name}': {kind} not on {base} run {base_run['id']}: {'; '.join(missing)[:600]}")
         crash = [f"the test helper died on signal {signal}" for signal in sorted(head_crash)]
-        what = "; ".join(crash + sorted(head_tests)) or "; ".join(sorted(head_errors))
+        what = "; ".join(crash + sorted(head_tests) + sorted(head_causes)) or "; ".join(sorted(head_errors))
         url = base_run.get("html_url") or f"https://github.com/{repo}/actions/runs/{base_run['id']}"
         audit.append(f"excused '{name}': {base} run {base_run['id']} fails the same way ({url}): {what[:400]}")
     return audit
