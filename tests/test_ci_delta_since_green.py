@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -321,6 +322,54 @@ class DecideTests(Case):
         delta.Git.run = refuse_fetch
         self.addCleanup(setattr, delta.Git, "run", original)
         self.assertIn("fatal: remote hung up", self.skip_reason({}))
+
+    def test_plain_fallback_does_not_inherit_a_stored_promisor_filter(self) -> None:
+        h1 = self.pr_head()
+        self.origin.commit("main", {"web/w.txt": "w1\n"})
+        self.origin.merge_main_into_pr()
+        self.origin.commit("pr", {"docs/d.txt": "resolved\n"}, "resolve")
+        merge, head = self.origin.tested_merge()
+        work = self.origin.checkout(merge)
+        checkout = delta.Git(work)
+        trace = self.origin.root / "fallback-packets.trace"
+        original = delta.Git.run
+        refusals: list[tuple[str, ...]] = []
+
+        def refuse_filtered_fetch(git_self, *args):
+            if args[0] == "fetch" and any(arg.startswith("--filter=") for arg in args):
+                refusals.append(args)
+                # A failed partial fetch can retain this remote configuration.
+                # The fallback must override it for this request, not erase it.
+                git(git_self.cwd, "config", "remote.origin.promisor", "true")
+                git(git_self.cwd, "config", "remote.origin.partialclonefilter", "tree:0")
+                raise subprocess.CalledProcessError(
+                    128, ["git", *args], stderr="fatal: filter refused after partial setup\n",
+                )
+            return original(git_self, *args)
+
+        with patch.object(delta.Git, "run", refuse_filtered_fetch), \
+                patch.dict(os.environ, {"GIT_TRACE_PACKET": str(trace)}):
+            try:
+                decision = delta.decide(
+                    checkout, merge, head,
+                    lambda oids: {oid: "success" for oid in oids if oid == h1},
+                )
+            finally:
+                self.assertTrue(trace.is_file(), "the fallback must perform a real fetch")
+                packets = trace.read_text()
+                self.assertRegex(packets, r"packet:\s+\S+[<>]\s+want [0-9a-f]{40}")
+                self.assertNotRegex(packets, r"packet:\s+\S+[<>]\s+filter(?:\s|$)")
+
+        self.assertEqual(decision.base, h1)
+        self.assertEqual(set(git(work, "diff", "--name-only", h1, "HEAD").split()),
+                         {"web/w.txt", "docs/d.txt"})
+        self.assertEqual(git(work, "config", "remote.origin.promisor"), "true")
+        self.assertEqual(git(work, "config", "remote.origin.partialclonefilter"), "tree:0")
+        self.assertTrue(refusals)
+        self.assertEqual(len(checkout.notes), len(refusals))
+        for note in checkout.notes:
+            self.assertIn("fatal: filter refused after partial setup", note)
+            self.assertIn("retried without it", note)
 
     def test_head_that_is_not_the_tested_merge_parent_does_not_apply(self) -> None:
         self.pr_head()
