@@ -114,7 +114,7 @@ class Git:
         with their contents, which is slower but routes the same. When both
         fail the delta does not apply, and the reason carries git's stderr.
         """
-        attempts = ((object_filter, *args), args)
+        attempts = ((object_filter, *args), ("--no-filter", *args))
         for index, attempt in enumerate(attempts):
             try:
                 self.run("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", *attempt)
