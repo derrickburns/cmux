@@ -563,6 +563,15 @@ class ComparisonSourceTests(unittest.TestCase):
         self.assertEqual(self.checked(self.work, "rev-parse", probe.ref), self.feat)
         self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
 
+    def test_a_later_ref_change_cannot_replace_the_selected_comparison_bytes(self) -> None:
+        self.checked(self.work, "fetch", "-q", "--depth=1", self.official.as_uri(),
+                     f"{self.feat}:refs/remotes/origin/feat-cmux-next")
+        probe = self.probe()
+        self.assertIsNotNone(probe.other)
+        self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
+        self.checked(self.work, "update-ref", probe.ref, "HEAD")
+        self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
+
     def test_upstream_keeps_the_origin_route_without_an_api_dependency(self) -> None:
         self.origin_is_official = True
         self.environment.update(GITHUB_REPOSITORY="manaflow-ai/cmux", GITHUB_REPOSITORY_ID="1144115288")
