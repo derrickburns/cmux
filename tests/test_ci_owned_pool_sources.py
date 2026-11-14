@@ -30,6 +30,8 @@ so no file tells them apart.)
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import shutil
 import subprocess
@@ -37,7 +39,11 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import urllib.request
 from pathlib import Path
+from unittest.mock import patch
+
+from git_fixture_env import without_auto_maintenance
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "ci"))
@@ -409,6 +415,211 @@ class OwnedPoolSources(unittest.TestCase):
         if feat is None:
             self.skipTest("feat-cmux-next's workflows are not readable here")
         self.assertIn(".github/workflows/cmux-next-base-autofix.yml", self.owned[str(feat)])
+
+class ComparisonSourceTests(unittest.TestCase):
+    """Exercise the ordinary guard with distinct fork and official Git owners."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="owned-comparison-")
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.official = self.directory / "official"
+        self.fork = self.directory / "fork"
+        self.work = self.directory / "work"
+        self.git_env = without_auto_maintenance({
+            **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "comparison fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "comparison fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+            "GIT_NO_LAZY_FETCH": "1",
+        })
+        self.official.mkdir()
+        self.checked(self.official, "init", "-q", "-b", "main")
+        for key in ("uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"):
+            self.checked(self.official, "config", key, "true")
+        for name in (sources.POOL_SCRIPT, sources.POLICY_SCRIPT):
+            self.put(self.official, name, (ROOT / name).read_text())
+        self.watched = (".github/workflows/common.yml", ".github/workflows/cmux-next-base-autofix.yml")
+        self.put(self.official, sources.RESCUE_SCRIPT,
+                 f"WATCHED_WORKFLOW_PATHS = {self.watched!r}\nUNRESCUED_WORKFLOW_PATHS = {{}}\n")
+        self.put(self.official, self.watched[0], "jobs:\n  test:\n    runs-on: glaeda-test\n")
+        self.checked(self.official, "add", ".")
+        self.checked(self.official, "commit", "-q", "-m", "official main")
+        self.main = self.checked(self.official, "rev-parse", "HEAD")
+        self.checked(self.official, "checkout", "-q", "-b", FEAT)
+        self.put(self.official, self.watched[1],
+                 "jobs:\n  test:\n    runs-on: glaeda-test\n    steps:\n"
+                 "      - run: python3 scripts/ci/comparison_picker.py\n")
+        self.put(self.official, "scripts/ci/comparison_picker.py", "import pr_runner_pool\n")
+        self.put(self.official, "scripts/ci/unrelated_comparison.py", "# not read by the detector\n")
+        self.put(self.official, "Sources/NotAComparisonInput.swift", "// must remain blob-less\n")
+        self.checked(self.official, "add", ".")
+        self.checked(self.official, "commit", "-q", "-m", "official comparison")
+        self.feat = self.checked(self.official, "rev-parse", "HEAD")
+        self.checked(self.directory, "clone", "-q", "--depth=1", "--single-branch", "--branch=main",
+                     self.official.as_uri(), str(self.fork))
+        self.put(self.fork, sources.RESCUE_SCRIPT,
+                 f"WATCHED_WORKFLOW_PATHS = {(*self.watched, '.github/workflows/fork-only.yml')!r}\n"
+                 "UNRESCUED_WORKFLOW_PATHS = {}\n")
+        self.checked(self.fork, "add", ".")
+        self.checked(self.fork, "commit", "-q", "-m", "fork policy")
+        self.checked(self.directory, "clone", "-q", "--depth=1", self.fork.as_uri(), str(self.work))
+        self.checked(self.work, "remote", "set-url", "origin", "https://github.com/derrickburns/cmux.git")
+        self.environment = {
+            "GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "derrickburns/cmux",
+            "GITHUB_REPOSITORY_ID": "1456369951", "GITHUB_BASE_REF": "main",
+            "GITHUB_REF_NAME": "fixture", "CMUX_OWNED_POOL_BRANCH": "main",
+            "GH_TOKEN": "fixture-public-read-token",
+        }
+        self.calls: list[tuple[str, ...]] = []
+        self.requests: list[urllib.request.Request] = []
+        self.documents: dict[str, object] = {}
+        self.fail_fetch = False
+        self.origin_is_official = False
+
+    @staticmethod
+    def put(root: Path, name: str, text: str) -> None:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def command(self, root: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                               "-C", str(root), *args], input=stdin, capture_output=True,
+                              text=True, env=self.git_env)
+
+    def checked(self, root: Path, *args: str) -> str:
+        result = self.command(root, *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def transport(self, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+        self.calls.append(args)
+        mapped = list(args)
+        if "fetch" in args:
+            if self.fail_fetch and "https://github.com/manaflow-ai/cmux.git" in args:
+                return subprocess.CompletedProcess(args, 128, "", "controlled official fetch failure")
+            mapped = [self.official.as_uri() if arg == "https://github.com/manaflow-ai/cmux.git"
+                      else (self.official if self.origin_is_official else self.fork).as_uri()
+                      if arg == "origin" else arg for arg in args]
+        return self.command(self.work, *mapped, stdin=stdin)
+
+    def listing(self, sha: str, directory: str) -> list[dict]:
+        rows = []
+        for line in self.checked(self.official, "ls-tree", "-l", sha, directory + "/").splitlines():
+            header, path = line.split("\t", 1)
+            _, kind, oid, size = header.split()
+            rows.append({"name": path.rsplit("/", 1)[-1], "path": path, "sha": oid,
+                         "size": int(size) if kind == "blob" else 0,
+                         "type": "file" if kind == "blob" else "dir"})
+        return rows
+
+    def api(self, request: urllib.request.Request, **kwargs) -> io.BytesIO:
+        self.requests.append(request)
+        path = request.full_url.removeprefix("https://api.github.com/repos/")
+        if path in self.documents:
+            body = self.documents[path]
+        elif path == "derrickburns/cmux":
+            body = {"id": 1456369951, "full_name": "derrickburns/cmux", "fork": True,
+                    "owner": {"login": "derrickburns", "type": "User"},
+                    "parent": {"id": 1144115288, "full_name": "manaflow-ai/cmux"}}
+        elif path.startswith("manaflow-ai/cmux/git/ref/heads/"):
+            name = path.rsplit("/", 1)[-1]
+            body = {"ref": "refs/heads/" + name,
+                    "object": {"type": "commit", "sha": self.main if name == "main" else self.feat}}
+        elif path.startswith("manaflow-ai/cmux/contents/"):
+            directory, sha = path.removeprefix("manaflow-ai/cmux/contents/").split("?ref=")
+            body = self.listing(sha, directory)
+        else:
+            self.fail(f"unexpected public API input: {path}")
+        return io.BytesIO(json.dumps(body).encode())
+
+    def probe(self):
+        probe = type("ComparisonProbe", (OwnedPoolSources,), {})
+        with patch.dict(globals(), {"ROOT": self.work, "ON_CI": True}), \
+                patch.dict(os.environ, self.environment), \
+                patch(__name__ + ".git", self.transport), \
+                patch("urllib.request.urlopen", self.api):
+            probe.setUpClass()
+        return probe
+
+    def test_fork_reads_the_official_comparison_without_hydrating_app_or_unread_scripts(self) -> None:
+        probe = self.probe()
+        self.assertIsNotNone(probe.other, "CI must actually read the official other branch")
+        self.assertTrue(probe.ref.startswith("refs/cmux-ci/upstream/manaflow-ai/cmux/"), probe.ref)
+        self.assertEqual(self.checked(self.work, "rev-parse", probe.ref), self.feat)
+        self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
+        for path in ("Sources/NotAComparisonInput.swift", "scripts/ci/unrelated_comparison.py"):
+            oid = self.checked(self.official, "rev-parse", f"{self.feat}:{path}")
+            self.assertNotEqual(self.command(self.work, "cat-file", "-e", oid).returncode, 0, path)
+        self.assertNotEqual(self.command(self.work, "rev-parse", "--verify", "--quiet",
+                                         "refs/remotes/origin/feat-cmux-next").returncode, 0)
+        self.assertTrue(self.requests)
+
+    def test_an_existing_origin_comparison_cannot_impersonate_upstream(self) -> None:
+        self.checked(self.work, "update-ref", "refs/remotes/origin/feat-cmux-next", "HEAD")
+        probe = self.probe()
+        self.assertEqual(self.checked(self.work, "rev-parse", probe.ref), self.feat)
+        self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
+
+    def test_upstream_keeps_the_origin_route_without_an_api_dependency(self) -> None:
+        self.origin_is_official = True
+        self.environment.update(GITHUB_REPOSITORY="manaflow-ai/cmux", GITHUB_REPOSITORY_ID="1144115288")
+        self.checked(self.work, "remote", "set-url", "origin", "https://github.com/manaflow-ai/cmux.git")
+        probe = self.probe()
+        self.assertEqual(probe.ref, "origin/feat-cmux-next")
+        self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
+        self.assertEqual(self.requests, [])
+
+    def test_wrong_repository_parent_and_ref_are_refused_before_fetch(self) -> None:
+        valid = {"id": 1456369951, "full_name": "derrickburns/cmux", "fork": True,
+                 "owner": {"login": "derrickburns", "type": "User"},
+                 "parent": {"id": 1144115288, "full_name": "manaflow-ai/cmux"}}
+        cases = (
+            ("derrickburns/cmux", {**valid, "id": 99}),
+            ("derrickburns/cmux", {**valid, "full_name": "foreign/cmux"}),
+            ("derrickburns/cmux", {**valid, "parent": {"id": 99, "full_name": "foreign/cmux"}}),
+            ("manaflow-ai/cmux/git/ref/heads/feat-cmux-next",
+             {"ref": "refs/heads/main", "object": {"type": "commit", "sha": self.feat}}),
+            ("manaflow-ai/cmux/git/ref/heads/feat-cmux-next",
+             {"ref": "refs/heads/feat-cmux-next", "object": {"type": "tree", "sha": self.feat}}),
+        )
+        for path, body in cases:
+            with self.subTest(path=path, body=body):
+                self.documents = {path: body}
+                self.calls.clear()
+                with self.assertRaisesRegex(RuntimeError, "comparison"):
+                    self.probe()
+                self.assertFalse(any("fetch" in call for call in self.calls))
+
+    def test_source_budget_is_checked_before_any_fetch(self) -> None:
+        path = f"manaflow-ai/cmux/contents/.github/workflows?ref={self.feat}"
+        rows = self.listing(self.feat, ".github/workflows")
+        rows[0]["size"] = 17 * 1024 * 1024
+        self.documents[path] = rows
+        with self.assertRaisesRegex(RuntimeError, "comparison"):
+            self.probe()
+        self.assertFalse(any("fetch" in call for call in self.calls))
+
+    def test_failed_official_fetch_remains_a_ci_failure(self) -> None:
+        self.fail_fetch = True
+        with self.assertRaisesRegex(RuntimeError, "comparison"):
+            self.probe()
+
+    def test_a_conflicting_cached_namespace_is_not_rebound(self) -> None:
+        ref = f"refs/cmux-ci/upstream/manaflow-ai/cmux/{FEAT}/{self.feat}"
+        self.checked(self.work, "update-ref", ref, "HEAD")
+        with self.assertRaisesRegex(RuntimeError, "comparison"):
+            self.probe()
+        self.assertFalse(any("fetch" in call for call in self.calls))
+
+    def test_the_main_rescue_copy_stays_authoritative_when_checking_feat(self) -> None:
+        self.environment.update(CMUX_OWNED_POOL_BRANCH=FEAT, GITHUB_BASE_REF=FEAT)
+        probe = self.probe()
+        self.assertEqual(self.checked(self.work, "rev-parse", probe.ref), self.main)
+        self.assertIs(probe.rescue_tree, probe.other)
+        self.assertEqual(probe.watched, frozenset(self.watched))
+
 
 if __name__ == "__main__":
     unittest.main()
