@@ -1,5 +1,7 @@
 """gh-merge-green excuses a red check only when the base branch's latest completed run has the same failures."""
 import copy
+import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -225,23 +227,18 @@ class Excusing(unittest.TestCase):
         self.gh.json = json_with_checks
 
     def test_a_red_ci_status_is_judged_by_the_failed_jobs_of_its_run(self):
-        self.gh.jobs[3] = {"id": 3, "run_id": 10, "head_sha": HEAD, "name": "ci-status", "status": "completed",
-                           "conclusion": "failure", "steps": [{"name": "Report", "conclusion": "failure"}]}
-        self.with_checks([{"id": 3, "name": "ci-status", "status": "completed", "conclusion": "failure",
-                           "app": {"slug": "github-actions"},
-                           "details_url": f"https://github.com/{REPO}/actions/runs/10/job/3"}])
+        # The required check needs its real declared routing context, not a
+        # generic name-only "Report" failure that could hide a routing fault.
+        self.gh = DeclaredDependencyGitHub()
         lines = excuse.judge(REPO, "feat-cmux-next", HEAD, [], self.gh, checks=["ci-status"])
-        self.assertIn(SWIFT, "\n".join(lines))
-        self.assertNotIn("'ci-status'", "\n".join(lines))
+        self.assertIn("Fast static checks", "\n".join(lines))
+        self.assertIn("unexecuted", "\n".join(lines))
 
     def test_a_red_ci_status_with_no_other_failed_job_blocks(self):
-        self.gh.jobs[1]["conclusion"] = "success"
-        self.gh.jobs[3] = {"id": 3, "run_id": 10, "head_sha": HEAD, "name": "ci-status", "status": "completed",
-                           "conclusion": "failure", "steps": [{"name": "Report", "conclusion": "failure"}]}
-        self.with_checks([{"id": 3, "name": "ci-status", "status": "completed", "conclusion": "failure",
-                           "app": {"slug": "github-actions"},
-                           "details_url": f"https://github.com/{REPO}/actions/runs/10/job/3"}])
-        with self.assertRaisesRegex(excuse.Refused, "no failed job"):
+        self.gh = DeclaredDependencyGitHub()
+        for logical in ("static-preflight", "linux-preflight"):
+            self.gh.logical[10][logical]["conclusion"] = "success"
+        with self.assertRaises(excuse.Refused):
             excuse.judge(REPO, "feat-cmux-next", HEAD, [], self.gh, checks=["ci-status"])
 
 
@@ -482,6 +479,347 @@ class StructuredStaticPreflight(unittest.TestCase):
                 self.gh.logs[1] = self.body().replace(field, "another-owner")
                 with self.assertRaises(excuse.Refused):
                     self.judge()
+
+
+CI_NEEDS = ("changes", "fast-guards", "claude-wrapper", "suite-coverage", "ui-tests",
+            "static-preflight", "guards", "ghosttykit-release-check", "browser", "remote-daemon",
+            "web", "linux-preflight", "macos-admission-gate", "macos")
+LINUX_NEEDS = ("changes", "static-preflight", "fast-guards", "guards", "ghosttykit-release-check", "web")
+CI_SOURCE = (ROOT / ".github/workflows/ci.yml").read_bytes()
+CI_SOURCE_HASH = "e13d007598ac5617fe87a327ef5273bf97df7b189bf937e7ab8d2631c204cb8d"
+
+
+def retained_program(first, last):
+    """Exact reviewed workflow echo, not an execution of its Python program."""
+    lines = CI_SOURCE.decode().splitlines()
+    return "\n".join(line[10:] for line in lines[first - 1:last]).rstrip()
+
+
+LINUX_PROGRAM = retained_program(1447, 1534)
+PLATFORM_PROGRAM = retained_program(1749, 1828)
+
+
+def dependency_log(name, needs, body):
+    step, variable, program = (("Check routed Linux results", "PREFLIGHT_NEEDS", LINUX_PROGRAM)
+                               if name == "linux-preflight" else
+                               ("Check platform workflow routing", "PLATFORM_NEEDS", PLATFORM_PROGRAM))
+    encoded = json.dumps(needs, indent=2).splitlines()
+    return log(name, step, "##[group]Run python3 - <<'PY'",
+               *["^[[36;1m" + line + "^[[0m" for line in program.rstrip("\n").split("\n")],
+               "shell: /usr/bin/bash -e {0}", "env:",
+               "  CI_CACHE_R2_PUBLIC_URL: https://ci-cache.cmux.com",
+               '  CI_OWNED_HEAD_REPOS: ["manaflow-ai/cmux", "teamleaderleo/cmux"]',
+               "  " + variable + ": " + encoded[0], *encoded[1:],
+               "##[endgroup]", *body, "##[error]Process completed with exit code 1.")
+
+
+class DeclaredDependencyGitHub:
+    """Sanitized initial-attempt shape of the retained base/e3 CI graph.
+
+    IDs and ordinary successful step names are synthetic. The complete workflow
+    and the two echoed programs come from the real pinned source. No gh/process
+    or workflow program executes through this boundary.
+    """
+
+    def __init__(self):
+        assert hashlib.sha256(CI_SOURCE).hexdigest() == CI_SOURCE_HASH
+        assert hashlib.sha256(LINUX_PROGRAM.encode()).hexdigest() == "49f81e56acc38ce06ae7468c11abedbd6aa6e4fa5ab26176edcdab60dae137d0"
+        assert hashlib.sha256(PLATFORM_PROGRAM.encode()).hexdigest() == "4e52775680a43a6eacfe0584229e78162fb58b5eb47c2cac0ab42ce91437784c"
+        self.routes = []
+        self.jobs, self.logs, self.logical, self.needs = {}, {}, {}, {}
+        self.runs = {run: {"id": run, "workflow_id": 7, "head_sha": sha,
+                           "head_branch": branch, "path": ".github/workflows/ci.yml",
+                           "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                           "event": event, "repository": {"full_name": REPO}}
+                     for run, sha, branch, event in [(10, HEAD, "work", "pull_request"),
+                                                      (20, BASE_SHA, "feat-cmux-next", "workflow_dispatch")]}
+        self.workflow_source = CI_SOURCE
+        for run, sha in ((10, HEAD), (20, BASE_SHA)):
+            outputs = dict.fromkeys(("macos", "cli", "unit_suite", "linux_guard_tests", "linux_guard_history",
+                                     "linux_guard_cli", "linux_guard_source", "ghosttykit_release"), "true")
+            outputs.update(dict.fromkeys(("full_suite", "swift_packages", "web", "agent_session_web",
+                                          "browser", "remote_daemon", "claude_wrapper", "coverage_gap"), "false"))
+            outputs["source_parent1"] = BASE_SHA if run == 10 else "c" * 40
+            outputs["coverage_fingerprint"] = (f"v1;sha={sha};ref={self.runs[run]['head_branch']};"
+                                                 "cache=r2;release=universal;coverage=" +
+                                                 ("compile-only" if run == 10 else "full"))
+            if run == 20:
+                outputs.update(dict.fromkeys(("full_suite", "swift_packages", "web", "agent_session_web",
+                                              "browser", "remote_daemon", "claude_wrapper"), "true"))
+            states = dict.fromkeys(CI_NEEDS, "skipped")
+            states.update({"changes": "success", "fast-guards": "success", "guards": "success",
+                           "ghosttykit-release-check": "success", "static-preflight": "failure",
+                           "linux-preflight": "failure", "ci-status": "failure"})
+            if run == 20:
+                states.update({"fast-guards": "failure", "web": "failure", "browser": "success"})
+            self.needs[run] = {name: {"result": states[name], "outputs": outputs if name == "changes" else {}}
+                               for name in CI_NEEDS}
+            self.logical[run] = {}
+            for index, name in enumerate((*CI_NEEDS, "ci-status"), 1):
+                display = {"fast-guards": "CI fast guards", "static-preflight": "Fast static checks",
+                           "claude-wrapper": "Claude wrapper regressions", "ghosttykit-release-check": "GhosttyKit release check",
+                           "macos-admission-gate": "macOS admission gate"}.get(name, name)
+                if name in ("guards", "web", "browser") and states[name] != "skipped":
+                    display = name + " / " + ("Web status" if name == "web" else "checks")
+                step = "Run the contributor static preflight" if name == "static-preflight" else "Check routed Linux results" if name == "linux-preflight" else "Check platform workflow routing" if name == "ci-status" else "Run"
+                steps = [] if states[name] == "skipped" else [
+                    {"name": "Set up job", "status": "completed", "conclusion": "success"},
+                    {"name": step, "status": "completed", "conclusion": states[name]},
+                    *([{"name": "Check routed CI jobs", "status": "completed", "conclusion": "skipped"}]
+                      if name == "ci-status" else []),
+                    {"name": "Complete job", "status": "completed", "conclusion": "success"}]
+                item = {"id": index + (100 if run == 20 else 0), "run_id": run, "head_sha": sha,
+                        "name": display, "status": "completed", "conclusion": states[name], "steps": steps}
+                self.jobs[item["id"]] = item
+                self.logical[run][name] = item
+            self.refresh_logs(run)
+        self.check_runs = [{"check_runs": [{"id": 999, "name": "ci-status", "status": "completed",
+                           "conclusion": "failure", "app": {"slug": "github-actions"},
+                           "details_url": f"https://github.com/{REPO}/actions/runs/10/job/{self.logical[10]['ci-status']['id']}"}]}]
+        self.page_delta = 0
+
+    def refresh_logs(self, run):
+        n = self.needs[run]
+        linux_body = ["static-preflight: failure"]
+        if run == 20:
+            linux_body += ["fast-guards: failure", "web: failure (one or more web routes=true)"]
+        self.logs[self.logical[run]["linux-preflight"]["id"]] = dependency_log(
+            "linux-preflight", {k: n[k] for k in LINUX_NEEDS}, linux_body)
+        self.logs[self.logical[run]["ci-status"]["id"]] = dependency_log(
+            "ci-status", n, ["linux preflight did not pass: failure"])
+        self.logs[self.logical[run]["static-preflight"]["id"]] = StructuredStaticPreflight().body()
+
+    def json(self, route, *, paginate=False):
+        self.routes.append(route)
+        if "/contents/.github/workflows/ci.yml?ref=" in route:
+            raw = self.workflow_source
+            return {"type": "file", "path": ".github/workflows/ci.yml", "encoding": "base64",
+                    "size": len(raw), "sha": hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest(),
+                    "content": base64.b64encode(raw).decode()}
+        if route.endswith(f"commits/{HEAD}/check-runs?per_page=100"):
+            return copy.deepcopy(self.check_runs)
+        if "/actions/workflows/" in route and "/runs?" in route:
+            return {"workflow_runs": [copy.deepcopy(self.runs[20])] if "/workflows/7/" in route else []}
+        if "/actions/jobs/" in route:
+            return copy.deepcopy(self.jobs[int(route.rsplit("/", 1)[1])])
+        if "/actions/runs/" in route:
+            tail = route.split("/actions/runs/", 1)[1]
+            run = int(tail.split("/", 1)[0])
+            if "/jobs?" in tail:
+                jobs = [copy.deepcopy(x) for x in self.jobs.values() if x["run_id"] == run]
+                result = {"total_count": len(jobs) + self.page_delta, "jobs": jobs}
+                return [result] if paginate else result
+            return copy.deepcopy(self.runs[run])
+        raise AssertionError(route)
+
+    def log(self, repo, job):
+        return self.logs[job["id"]]
+
+
+class DependencyRollups(unittest.TestCase):
+    def setUp(self):
+        self.gh = DeclaredDependencyGitHub()
+
+    def judge(self, checks=False):
+        return excuse.judge(REPO, "feat-cmux-next", HEAD, [] if checks else [10], self.gh,
+                            checks=["ci-status"] if checks else [])
+
+    def test_complete_initial_dependency_chain_closes_through_both_callers(self):
+        for checks in (False, True):
+            with self.subTest(checks=checks):
+                self.setUp()
+                audit = "\n".join(self.judge(checks))
+                for marker in ("Fast static checks", "linux-preflight", "ci-status", "unexecuted"):
+                    self.assertIn(marker, audit)
+
+    def test_name_only_ci_status_failure_is_not_dependency_proof(self):
+        for checks in (False, True):
+            with self.subTest(checks=checks):
+                legacy = Excusing()
+                legacy.setUp()
+                gh = legacy.gh
+                gh.jobs[3] = failed_job(3, 10, HEAD, "ci-status", "Independent route decision")
+                gh.logs[3] = log("ci-status", "Independent route decision", "invalid independent route")
+                legacy.with_checks([{"id": 3, "name": "ci-status", "status": "completed", "conclusion": "failure",
+                                     "app": {"slug": "github-actions"},
+                                     "details_url": f"https://github.com/{REPO}/actions/runs/10/job/3"}])
+                with self.assertRaises(excuse.Refused):
+                    excuse.judge(REPO, "feat-cmux-next", HEAD, [] if checks else [10], gh,
+                                 checks=["ci-status"] if checks else [])
+
+    def test_unknown_ci_status_body_cannot_hide_behind_the_failed_leaf(self):
+        j = self.gh.logical[10]["ci-status"]
+        self.gh.logs[j["id"]] = log("ci-status", "Check platform workflow routing", "independent routing failure")
+        with self.assertRaises(excuse.Refused):
+            self.judge(True)
+
+    def test_source_workflow_run_and_attempt_mismatches_refuse(self):
+        changes = ((10, "head_sha", "d" * 40), (20, "head_sha", "d" * 40),
+                   (10, "workflow_id", 9), (20, "head_branch", "other-base"),
+                   (10, "path", ".github/workflows/other.yml"), (10, "run_attempt", 2))
+        for run, key, value in changes:
+            with self.subTest(run=run, key=key):
+                self.setUp()
+                self.gh.runs[run][key] = value
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_changed_workflow_bytes_refuse_without_executing_them(self):
+        self.gh.workflow_source += b"\n# different graph\n"
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_partial_program_environment_and_body_boundaries_refuse(self):
+        before_after = (("import json", "import math"), ("PREFLIGHT_NEEDS", "OTHER_NEEDS"),
+                        ("##[endgroup]", ""), ("static-preflight: failure", ""),
+                        ("##[error]Process completed with exit code 1.", ""))
+        for before, after in before_after:
+            with self.subTest(before=before):
+                self.setUp()
+                j = self.gh.logical[10]["linux-preflight"]
+                self.gh.logs[j["id"]] = self.gh.logs[j["id"]].replace(before, after)
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_missing_extra_or_changed_needs_nodes_refuse(self):
+        for action in ("missing", "extra", "changed"):
+            with self.subTest(action=action):
+                self.setUp()
+                if action == "missing":
+                    del self.gh.needs[10]["browser"]
+                elif action == "extra":
+                    self.gh.needs[10]["unknown"] = {"result": "success", "outputs": {}}
+                else:
+                    self.gh.needs[10]["browser"]["result"] = "success"
+                self.gh.refresh_logs(10)
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_invalid_or_missing_guard_web_ghostty_and_later_routes_refuse(self):
+        for route in ("linux_guard_source", "web", "ghosttykit_release", "macos", "claude_wrapper", "full_suite"):
+            for value in (None, "unknown"):
+                with self.subTest(route=route, value=value):
+                    self.setUp()
+                    out = self.gh.needs[10]["changes"]["outputs"]
+                    if value is None:
+                        del out[route]
+                    else:
+                        out[route] = value
+                    self.gh.refresh_logs(10)
+                    with self.assertRaises(excuse.Refused):
+                        self.judge()
+
+    def test_required_work_skip_and_downstream_independent_faults_refuse(self):
+        for name in ("guards", "ghosttykit-release-check", "macos", "claude-wrapper", "ui-tests"):
+            with self.subTest(name=name):
+                self.setUp()
+                state = "skipped" if name in ("guards", "ghosttykit-release-check") else "failure"
+                self.gh.logical[10][name]["conclusion"] = state
+                if state == "skipped":
+                    self.gh.logical[10][name]["steps"] = []
+                self.gh.needs[10][name]["result"] = state
+                self.gh.refresh_logs(10)
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_extra_unknown_diagnostic_even_on_both_runs_refuses(self):
+        for run in (10, 20):
+            j = self.gh.logical[run]["linux-preflight"]
+            self.gh.logs[j["id"]] += "\n" + log("linux-preflight", "Check routed Linux results", "unknown fault")
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_wrong_job_display_or_step_mapping_refuses(self):
+        for name, field in (("static-preflight", "name"), ("linux-preflight", "steps")):
+            with self.subTest(name=name):
+                self.setUp()
+                j = self.gh.logical[10][name]
+                if field == "name":
+                    j[field] = "Another static checker"
+                else:
+                    j[field][1]["name"] = "Another step"
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_duplicate_logical_display_or_job_id_and_partial_pages_refuse(self):
+        for kind in ("display", "id", "page"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                j = copy.deepcopy(self.gh.logical[10]["guards"])
+                if kind == "page":
+                    self.gh.page_delta = 1
+                else:
+                    if kind == "display":
+                        j["id"] = 999
+                    self.gh.jobs[999] = j
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_other_failed_head_job_is_still_audited(self):
+        j = failed_job(500, 10, HEAD, "Independent check", "Independent step")
+        self.gh.jobs[500] = j
+        self.gh.logs[500] = log(j["name"], "Independent step", "error: head-only failure")
+        with self.assertRaises(excuse.Refused):
+            self.judge(True)
+
+    def test_new_leaf_cause_is_not_excused_by_the_dependency_summary(self):
+        j = self.gh.logical[10]["static-preflight"]
+        self.gh.logs[j["id"]] = self.gh.logs[j["id"]].replace("2026-11-06", "2026-11-07")
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_cancellation_timeout_and_setup_refusal_are_never_dependency_authority(self):
+        for state in ("cancelled", "timed_out", "setup"):
+            with self.subTest(state=state):
+                self.setUp()
+                j = self.gh.logical[10]["static-preflight"]
+                if state == "setup":
+                    j["steps"][0]["conclusion"] = "failure"
+                else:
+                    j["conclusion"] = state
+                with self.assertRaises(excuse.Refused):
+                    self.judge()
+
+    def test_later_ci_step_must_remain_explicitly_unexecuted(self):
+        j = self.gh.logical[10]["ci-status"]
+        j["steps"][2]["conclusion"] = "failure"
+        with self.assertRaises(excuse.Refused):
+            self.judge(True)
+
+    def test_job_run_source_and_completed_verdict_are_exact(self):
+        for field, value in (("run_id", 99), ("head_sha", "c" * 40),
+                             ("status", "in_progress"), ("id", 777)):
+            with self.subTest(field=field):
+                self.setUp()
+                self.gh.logical[10]["linux-preflight"][field] = value
+                with self.assertRaises(excuse.Refused):
+                    self.judge(True)
+
+    def test_duplicate_needs_json_keys_are_not_last_value_authority(self):
+        j = self.gh.logical[10]["linux-preflight"]
+        self.gh.logs[j["id"]] = self.gh.logs[j["id"]].replace(
+            '"result": "success",', '"result": "failure", "result": "success",', 1)
+        with self.assertRaises(excuse.Refused):
+            self.judge()
+
+    def test_unexpected_successful_rollup_step_is_not_hidden(self):
+        j = self.gh.logical[10]["ci-status"]
+        j["steps"].insert(1, {"name": "Independent route decision", "status": "completed", "conclusion": "success"})
+        with self.assertRaises(excuse.Refused):
+            self.judge(True)
+
+    def test_run_attempt_change_during_leaf_observation_refuses(self):
+        original = self.gh.log
+
+        def changed(repo, job):
+            value = original(repo, job)
+            if job["name"] == "Fast static checks":
+                self.gh.runs[10]["run_attempt"] = 2
+            return value
+
+        self.gh.log = changed
+        with self.assertRaises(excuse.Refused):
+            self.judge()
 
 
 if __name__ == "__main__":
