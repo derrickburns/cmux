@@ -55,12 +55,17 @@ class FakeGitHub:
         self.routes.append(route)
         if "/actions/runs/" in route and route.endswith("/jobs?filter=latest&per_page=100"):
             run = int(route.split("/actions/runs/", 1)[1].split("/", 1)[0])
-            return [{"jobs": [copy.deepcopy(job) for job in self.jobs.values() if job["run_id"] == run]}]
+            jobs = [copy.deepcopy(job) for job in self.jobs.values() if job["run_id"] == run]
+            return [{"jobs": jobs, "total_count": len(jobs)}]
         if "/actions/workflows/7/runs?" in route:
             assert "branch=feat-cmux-next" in route and "status=completed" in route, route
             return {"workflow_runs": copy.deepcopy(self.base_runs)}
         if "/actions/runs/" in route:
-            return {"id": int(route.rsplit("/", 1)[1]), "workflow_id": 7}
+            run = int(route.rsplit("/", 1)[1])
+            return {"id": run, "workflow_id": 7, "head_sha": HEAD if run == 10 else BASE_SHA,
+                    "head_branch": "work" if run == 10 else "feat-cmux-next", "run_attempt": 1,
+                    "path": ".github/workflows/portable-fixture.yml", "status": "completed", "conclusion": "failure",
+                    "event": "pull_request" if run == 10 else "push", "repository": {"full_name": REPO}}
         raise AssertionError(route)
 
     def log(self, repo, job):
@@ -823,6 +828,153 @@ class DependencyRollups(unittest.TestCase):
         self.gh.log = changed
         with self.assertRaises(excuse.Refused):
             self.judge()
+
+
+class CompleteRunInventories(unittest.TestCase):
+    """Every selected run is complete before choosing any failed job to audit."""
+
+    def fixture(self):
+        gh = DeclaredDependencyGitHub()
+        gh.jobs[500] = failed_job(500, 10, HEAD, "CI timing", "Independent step")
+        gh.logs[500] = log("CI timing", "Independent step", "error: independent head-only cause")
+        return gh
+
+    def judge(self, gh, checks=False):
+        return excuse.judge(REPO, "feat-cmux-next", HEAD, [] if checks else [10], gh,
+                            checks=["ci-status"] if checks else [])
+
+    def first_inventory(self, gh, change):
+        original = gh.json
+        count = 0
+
+        def selected(route, *, paginate=False):
+            nonlocal count
+            value = original(route, paginate=paginate)
+            if route == f"repos/{REPO}/actions/runs/10/jobs?filter=latest&per_page=100":
+                count += 1
+                if count == 1:
+                    return change(value)
+            return value
+
+        gh.json = selected
+
+    def test_complete_inventory_does_not_excuse_an_unrelated_failed_job(self):
+        for checks in (False, True):
+            with self.subTest(checks=checks), self.assertRaises(excuse.Refused):
+                self.judge(self.fixture(), checks)
+
+    def test_partial_first_inventory_cannot_hide_an_unrelated_failed_job(self):
+        for checks in (False, True):
+            with self.subTest(checks=checks):
+                gh = self.fixture()
+
+                def omit(pages):
+                    pages[0]["jobs"] = [j for j in pages[0]["jobs"] if j["id"] != 500]
+                    return pages
+
+                self.first_inventory(gh, omit)
+                with self.assertRaises(excuse.Refused):
+                    self.judge(gh, checks)
+
+    def test_changed_complete_snapshot_is_refused_instead_of_adopting_added_jobs(self):
+        for checks in (False, True):
+            with self.subTest(checks=checks):
+                gh = self.fixture()
+
+                def omit_with_count(pages):
+                    pages[0]["jobs"] = [j for j in pages[0]["jobs"] if j["id"] != 500]
+                    pages[0]["total_count"] -= 1
+                    return pages
+
+                self.first_inventory(gh, omit_with_count)
+                with self.assertRaises(excuse.Refused):
+                    self.judge(gh, checks)
+
+    def test_missing_initial_count_is_not_complete_inventory(self):
+        gh = DeclaredDependencyGitHub()
+
+        def missing(pages):
+            del pages[0]["total_count"]
+            return pages
+
+        self.first_inventory(gh, missing)
+        with self.assertRaises(excuse.Refused):
+            self.judge(gh)
+
+    def test_initial_duplicate_id_or_display_is_not_overwritten(self):
+        for key in ("id", "name"):
+            with self.subTest(key=key):
+                gh = DeclaredDependencyGitHub()
+
+                def duplicate(pages):
+                    rows = pages[0]["jobs"]
+                    rows[1][key] = rows[0][key]
+                    return pages
+
+                self.first_inventory(gh, duplicate)
+                with self.assertRaises(excuse.Refused):
+                    self.judge(gh)
+
+    def test_initial_foreign_job_source_run_or_status_refuses(self):
+        for field, value in (("run_id", 99), ("head_sha", "d" * 40), ("status", "in_progress")):
+            with self.subTest(field=field):
+                gh = DeclaredDependencyGitHub()
+
+                def changed(pages):
+                    pages[0]["jobs"][0][field] = value
+                    return pages
+
+                self.first_inventory(gh, changed)
+                with self.assertRaises(excuse.Refused):
+                    self.judge(gh)
+
+    def test_changed_successful_job_snapshot_is_not_ignored(self):
+        gh = DeclaredDependencyGitHub()
+        gh.jobs[500] = dict(failed_job(500, 10, HEAD, "CI timing", "Metrics"), conclusion="success")
+        for step in gh.jobs[500]["steps"]:
+            step["conclusion"] = "success"
+
+        def changed(pages):
+            next(j for j in pages[0]["jobs"] if j["id"] == 500)["steps"][-1]["name"] = "Different metrics"
+            return pages
+
+        self.first_inventory(gh, changed)
+        with self.assertRaises(excuse.Refused):
+            self.judge(gh)
+
+    def test_reordered_complete_pages_keep_the_same_inventory(self):
+        gh = DeclaredDependencyGitHub()
+
+        def reordered(pages):
+            rows = list(reversed(pages[0]["jobs"]))
+            count = pages[0]["total_count"]
+            return [{"jobs": rows[:5], "total_count": count}, {"jobs": rows[5:], "total_count": count}]
+
+        self.first_inventory(gh, reordered)
+        self.assertEqual(len(self.judge(gh)), 3)
+
+    def test_non_rollup_required_check_still_audits_all_failed_jobs_of_its_run(self):
+        owner = Excusing()
+        owner.setUp()
+        gh = owner.gh
+        gh.jobs[500] = failed_job(500, 10, HEAD, "CI timing", "Independent step")
+        gh.logs[500] = log("CI timing", "Independent step", "error: independent head-only cause")
+        owner.with_checks([{"id": 1, "name": SWIFT, "status": "completed", "conclusion": "failure",
+                            "app": {"slug": "github-actions"},
+                            "details_url": f"https://github.com/{REPO}/actions/runs/10/job/1"}])
+        with self.assertRaises(excuse.Refused):
+            excuse.judge(REPO, "feat-cmux-next", HEAD, [], gh, checks=[SWIFT])
+
+    def test_attempt_change_inside_inventory_collection_refuses(self):
+        gh = DeclaredDependencyGitHub()
+
+        def changed(pages):
+            gh.runs[10]["run_attempt"] = 2
+            return pages
+
+        self.first_inventory(gh, changed)
+        with self.assertRaises(excuse.Refused):
+            self.judge(gh)
 
 
 if __name__ == "__main__":
