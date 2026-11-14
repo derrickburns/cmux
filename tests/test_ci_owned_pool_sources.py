@@ -748,10 +748,11 @@ class ComparisonSourceTests(unittest.TestCase):
         self.assertTrue(probe.ref.startswith("refs/cmux-ci/upstream/manaflow-ai/cmux/"), probe.ref)
         self.assertEqual(self.checked(self.work, "rev-parse", probe.ref), self.feat)
         self.assertIn(self.watched[1], sources.owned_workflows(probe.other))
-        try:
-            probe("test_run_39638669325s_workflow_is_watched").test_run_39638669325s_workflow_is_watched()
-        except unittest.SkipTest as error:
-            self.fail(f"the ordinary counterpart assertion must execute for the new namespace: {error}")
+        result = unittest.TestResult()
+        probe("test_run_39638669325s_workflow_is_watched").run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(result.skipped, [], "the ordinary counterpart assertion must execute for the new namespace")
+        self.assertTrue(result.wasSuccessful(), result.failures + result.errors)
         for path in ("Sources/NotAComparisonInput.swift", "scripts/ci/unrelated_comparison.py"):
             oid = self.checked(self.official, "rev-parse", f"{self.feat}:{path}")
             self.assertNotEqual(self.command(self.work, "cat-file", "-e", oid).returncode, 0, path)
